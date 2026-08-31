@@ -15,7 +15,7 @@ Most callers only ever need ``run``::
 
     from mpengine import run
 
-    def my_task(x, y):          # must be module-level, see note below
+    def my_task(x, y):
         return x * y
 
     summary = run(
@@ -28,10 +28,11 @@ Most callers only ever need ``run``::
 That writes ``runs/manifests/<run_id>.txt``, ``runs/outputs/<run_id>/`` and
 ``runs/logs/<run_id>/``.
 
-Worker targets - ``func`` itself, and any custom ``save_fn`` - must be
-module-level functions so they can be pickled by reference. A lambda or a
-function defined inside another function will not survive the process boundary
-(this is a hard constraint of ``spawn``, which Windows always uses).
+Worker targets - ``func`` itself, and any custom ``save_fn`` - can be closures
+or lambdas, not just module-level functions. Jobs are serialized with
+``cloudpickle`` before crossing the process boundary, which can pickle a
+function by value (not just by reference). The one caveat: whatever a closure
+captures travels with every job that uses it.
 
 The dispatch core follows Lopez de Prado, *Advances in Financial Machine
 Learning*, Ch.20 - the docstrings name the specific snippets - but nothing here

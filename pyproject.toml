@@ -9,6 +9,7 @@ description = "A small, general-purpose multiprocessing engine: dispatch any cal
 requires-python = ">=3.13"
 dependencies = [
   "numpy>=2.5",
+  "cloudpickle>=3.1",
 ]
 
 # Only `mpengine` is packaged. The `learning` package (src/learning) holds the

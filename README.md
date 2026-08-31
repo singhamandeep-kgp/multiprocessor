@@ -24,7 +24,7 @@ pip install -e path/to/mpengine        # editable, for local development
 pip install path/to/mpengine           # or a plain install
 ```
 
-Only `numpy` is required.
+`numpy` and `cloudpickle` are required.
 
 ## Use
 
@@ -65,12 +65,16 @@ Develop with `debug=True`, then flip it off. Chasing a bug through a process
 pool means reading a `RemoteTraceback` from a worker that has already exited,
 and it never tells you which job dict was at fault.
 
-### The one hard constraint
+### Closures and lambdas
 
-`func`, and any custom `save_fn`, must be **module-level functions**. They are
-pickled by reference to cross the process boundary, so a lambda, a closure, or a
-function defined inside another function will fail. This is a property of
-`spawn`, which Windows always uses.
+`func`, and any custom `save_fn`, can be a closure or a lambda — not just a
+module-level function. Jobs are serialized with `cloudpickle` before crossing
+the process boundary, which (unlike stdlib `pickle`) can serialize a function
+by *value* (its bytecode plus whatever it captured), not just by reference.
+
+The one caveat: whatever a closure captures travels with **every job** that
+uses it — a closure capturing a large array re-serializes that array per job.
+That's a cost trade-off to be aware of, not a limitation on what's allowed.
 
 ## Going lower-level
 

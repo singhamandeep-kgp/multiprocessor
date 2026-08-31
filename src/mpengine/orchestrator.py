@@ -61,9 +61,9 @@ class RunSummary:
 
 
 def save_pickle(obj: Any, path: Path) -> None:
-    """Default save_fn. A caller-supplied save_fn must be module-level
-    (importable by reference) - like any other Pool target, it crosses the
-    Windows spawn boundary and a lambda or closure will fail to pickle."""
+    """Default save_fn. A caller-supplied save_fn can be a lambda or a closure
+    too - like any other job field, it crosses the process boundary via
+    `cloudpickle`, not stdlib `pickle`."""
     with open(path, "wb") as f:
         pickle.dump(obj, f)
 
@@ -140,9 +140,10 @@ def run(
     independently. An explicit path always wins over the derived one, so you
     can give a `base_dir` and still redirect just the logs elsewhere.
 
-    `func` must be module-level/importable (the same Windows-spawn constraint
-    `engine.py` already establishes) - a lambda or a function defined inside
-    another function will fail to pickle when `debug=False`.
+    `func` can be a closure or a lambda, not just a module-level function -
+    `engine.process_jobs` serializes jobs with `cloudpickle`, which can pickle
+    a function by value. The only cost: whatever a closure captures travels
+    with every job that uses it.
 
     Every destination directory gets a `<run_id>` subfolder (`task` + a
     timestamp), so successive runs never collide and a worker's log file

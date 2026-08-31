@@ -3,6 +3,6 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
-_demo_runner_scratch/
+_demo_*_scratch/
 build/
 dist/

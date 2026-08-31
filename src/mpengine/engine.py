@@ -19,6 +19,8 @@ import sys
 import time
 from typing import Any
 
+import cloudpickle
+
 
 def expand_call(kargs: dict[str, Any]) -> Any:
     """Ch.20 Snippet 20.10 (`expandCall`) - turn a job dict into a call.
@@ -63,6 +65,12 @@ def report_progress(job_num: int, num_jobs: int, time0: float, task: str) -> Non
     print(msg, end="\n" if job_num >= num_jobs else "\r", file=sys.stderr, flush=True)
 
 
+def _run_from_blob(blob: bytes) -> Any:
+    """Pool target: undo the cloudpickle wrapping `process_jobs` applies before
+    submission, then dispatch exactly as `expand_call` always has."""
+    return expand_call(cloudpickle.loads(blob))
+
+
 def process_jobs(jobs: list[dict[str, Any]], task: str | None = None, n_threads: int = 24) -> list[Any]:
     """Ch.20 Snippet 20.9 (`processJobs`) - real `mp.Pool` + `imap_unordered`.
 
@@ -71,10 +79,12 @@ def process_jobs(jobs: list[dict[str, Any]], task: str | None = None, n_threads:
     costs (see ex03), an early-submitted heavy job can finish long after
     several later-submitted light ones.
 
-    `expand_call` lives in this real, importable module, so it pickles by
-    reference with no dependence on `__main__` spawn fixup. Each job's 'func'
-    must likewise be importable by reference (module-level, not a lambda or
-    a nested function) - the same Windows-spawn constraint ex02/ex03 hit.
+    Each job is serialized with `cloudpickle` before submission (rather than
+    relying on `Pool`'s own stdlib-`pickle` handling of `jobs`), so a job's
+    'func' - or a nested callable, like `orchestrator.run`'s `save_fn` - can be
+    a closure or a lambda, not just a module-level function. `_run_from_blob`
+    is itself a plain module-level function, so it still pickles by reference
+    with no dependence on `__main__` spawn fixup.
 
     Uses explicit close()+join() rather than `with mp.Pool(...) as pool:`,
     whose __exit__ calls terminate() - an abrupt kill, not the book's graceful
@@ -83,11 +93,12 @@ def process_jobs(jobs: list[dict[str, Any]], task: str | None = None, n_threads:
     """
     if task is None:
         task = jobs[0]["func"].__name__
+    blobs = [cloudpickle.dumps(job) for job in jobs]
     pool = mp.Pool(processes=n_threads)
     out: list[Any] = []
     time0 = time.time()
     try:
-        for i, out_ in enumerate(pool.imap_unordered(expand_call, jobs), 1):
+        for i, out_ in enumerate(pool.imap_unordered(_run_from_blob, blobs), 1):
             out.append(out_)
             report_progress(i, len(jobs), time0, task)
     finally:

@@ -337,7 +337,7 @@ unblocked since the PDF text was captured in conversation).
 - VS Code is opened with `C:\Users\AmandeepSingh\Personal` as the workspace root.
   Workspace-level settings (`files.exclude` etc.) must live at
   `C:\Users\AmandeepSingh\Personal\.vscode\settings.json` — a nested `.vscode`
-  folder inside a subfolder (e.g. inside `Multiprocessing_and_Vectorisation`
+  folder inside a subfolder (e.g. inside `multiprocessor`
   itself) is inert and ignored by VS Code.
 - A personal Claude Code skill exists at
   `~/.claude/skills/hide-vscode-clutter/SKILL.md` (hides `*.egg-info`,

@@ -1,5 +1,7 @@
 # mpengine
 
+*(This repo is named `multiprocessor`; the package it ships is `mpengine` — see below.)*
+
 A small, general-purpose multiprocessing engine. Give it any callable and a list
 of parameter sets; it runs them across processes and leaves behind a record of
 what happened.

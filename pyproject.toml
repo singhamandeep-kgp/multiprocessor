@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mpengine"
+version = "0.1.0"
+description = "A small, general-purpose multiprocessing engine: dispatch any callable across processes with run manifests, per-worker logs, on-disk outputs and failure isolation"
+requires-python = ">=3.13"
+dependencies = [
+  "numpy>=2.5",
+]
+
+# Only `mpengine` is packaged. The `learning` package (src/learning) holds the
+# AFML Ch.20 exercises this engine grew out of - it depends on `statarb` and is
+# deliberately NOT shipped, so installing mpengine into another project never
+# drags in the exercises or their data-warehouse coupling. It stays importable
+# locally because the editable install puts all of src/ on sys.path.
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["mpengine*"]
+
+# `statarb` (needed only by src/learning) is installed separately as an editable
+# path install (pip install -e ../Equity_StatArb) rather than declared here,
+# since a relative file:// dependency URL is not portably supported across pip
+# versions/platforms.

@@ -73,4 +73,4 @@ __all__ = [
     "parts_to_molecules",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

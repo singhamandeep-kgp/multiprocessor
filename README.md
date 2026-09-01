@@ -20,11 +20,20 @@ job and the rest continue.
 ## Install
 
 ```bash
-pip install -e path/to/mpengine        # editable, for local development
-pip install path/to/mpengine           # or a plain install
+pip install mpengine
 ```
 
-`numpy`, `cloudpickle`, and `tqdm` are required.
+Requires Python 3.10+. `numpy`, `cloudpickle` and `tqdm` come with it —
+pip installs them for you.
+
+<details>
+<summary>Installing from source instead</summary>
+
+```bash
+pip install git+https://github.com/singhamandeep-kgp/multiprocessor.git   # latest from GitHub
+pip install -e path/to/multiprocessor                                     # editable, for developing mpengine itself
+```
+</details>
 
 ## Use
 

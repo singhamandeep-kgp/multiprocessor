@@ -54,8 +54,8 @@ def main() -> None:
     print(f"\n--- manifest ({summary.manifest_path}) ---")
     print(Path(summary.manifest_path).read_text())
 
-    output_dir = SCRATCH / "outputs" / summary.run_id
-    log_dir = SCRATCH / "logs" / summary.run_id
+    output_dir = Path(summary.output_dir)
+    log_dir = Path(summary.log_dir)
     print(f"--- output files in {output_dir} ---")
     for p in sorted(output_dir.iterdir()):
         print(f"  {p.name}")

@@ -24,14 +24,14 @@ pip install -e path/to/mpengine        # editable, for local development
 pip install path/to/mpengine           # or a plain install
 ```
 
-`numpy` and `cloudpickle` are required.
+`numpy`, `cloudpickle`, and `tqdm` are required.
 
 ## Use
 
 ```python
 from mpengine import run
 
-def my_task(x, y):        # must be module-level - see the constraint below
+def my_task(x, y):
     return x * y
 
 summary = run(
@@ -51,15 +51,33 @@ for r in summary.results:
 `output_dir`, `log_dir`, `manifest_dir` — an explicit path always wins, so you
 can give a `base_dir` and still redirect just the logs.
 
+### Reading the results back
+
+Results are written to disk, one file per job (pickled by default). To load a
+finished run back into memory as `{label: result}`:
+
+```python
+from mpengine import load_run_outputs
+
+outputs = load_run_outputs(summary.output_dir)   # or the path run() printed
+print(outputs["job_0000"])
+```
+
+Only successful jobs appear — a failed job never wrote a file, so its label is
+absent; check `summary.results` to see which failed and why. If you wrote the
+run with a custom `save_fn`, pass the matching reader as
+`load_run_outputs(..., load_fn=your_loader)`.
+
 ### Other options
 
 | argument | meaning |
 |---|---|
-| `save_fn` | how each result is written. Default `save_pickle`; supply your own (e.g. parquet) — it must be module-level |
+| `save_fn` | how each result is written. Default `save_pickle`; supply your own (e.g. parquet) |
 | `labels` | names for each job; defaults to `job_0000`, `job_0001`, … |
 | `task` | names the run; defaults to `func.__name__` |
 | `n_threads` | worker count; defaults to `min(cpu_count, 8)` |
 | `debug` | run sequentially in-process — real tracebacks you can attach a debugger to, no pool |
+| `show_progress` | live terminal display: one overall bar for the whole run, plus a live rate number per worker process. Ignored when `debug=True` |
 
 Develop with `debug=True`, then flip it off. Chasing a bug through a process
 pool means reading a `RemoteTraceback` from a worker that has already exited,

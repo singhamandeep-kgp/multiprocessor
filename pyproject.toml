@@ -10,6 +10,7 @@ requires-python = ">=3.13"
 dependencies = [
   "numpy>=2.5",
   "cloudpickle>=3.1",
+  "tqdm>=4.70",
 ]
 
 # Only `mpengine` is packaged. The `learning` package (src/learning) holds the
@@ -20,6 +21,12 @@ dependencies = [
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["mpengine*"]
+
+# worker_names.json is data, not code - setuptools' package discovery above
+# only picks up .py files by default, so it needs to be listed explicitly to
+# actually ship inside a built wheel.
+[tool.setuptools.package-data]
+mpengine = ["worker_names.json"]
 
 # `statarb` (needed only by src/learning) is installed separately as an editable
 # path install (pip install -e ../Equity_StatArb) rather than declared here,

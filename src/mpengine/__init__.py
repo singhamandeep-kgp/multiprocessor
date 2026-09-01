@@ -40,7 +40,15 @@ is finance-specific; it parallelizes any callable.
 """
 
 from mpengine.engine import expand_call, process_jobs, process_jobs_, report_progress
-from mpengine.orchestrator import JobResult, RunSummary, run, save_pickle
+from mpengine.orchestrator import (
+    JobResult,
+    RunSummary,
+    WorkerStats,
+    load_pickle,
+    load_run_outputs,
+    run,
+    save_pickle,
+)
 from mpengine.partition import equal_chunks, lin_parts, nested_parts, parts_to_molecules
 
 __all__ = [
@@ -48,7 +56,11 @@ __all__ = [
     "run",
     "RunSummary",
     "JobResult",
+    "WorkerStats",
     "save_pickle",
+    # reading a finished run's outputs back
+    "load_run_outputs",
+    "load_pickle",
     # lower-level dispatch, if you want to drive the pool yourself
     "expand_call",
     "process_jobs",

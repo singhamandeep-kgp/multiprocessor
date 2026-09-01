@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import datetime as dt
 import multiprocessing as mp
+import os
 import sys
 import time
-from typing import Any
+from typing import Any, Callable
 
 import cloudpickle
 
@@ -65,13 +66,30 @@ def report_progress(job_num: int, num_jobs: int, time0: float, task: str) -> Non
     print(msg, end="\n" if job_num >= num_jobs else "\r", file=sys.stderr, flush=True)
 
 
-def _run_from_blob(blob: bytes) -> Any:
+def _run_from_blob(blob: bytes) -> tuple[int, float, Any]:
     """Pool target: undo the cloudpickle wrapping `process_jobs` applies before
-    submission, then dispatch exactly as `expand_call` always has."""
-    return expand_call(cloudpickle.loads(blob))
+    submission, then dispatch exactly as `expand_call` always has.
+
+    Returns `(pid, atom_seconds, result)`. The pid attributes the completion to
+    a specific worker process; `atom_seconds` is measured around the call
+    itself, *inside* the worker, so it is pure compute time - it cannot include
+    queueing, spawn cost, or the idle gap between this atom finishing and the
+    rest of the run finishing. That distinction is the whole point: timing the
+    same thing from the parent would measure when the result *arrived*, not how
+    long the work actually took.
+    """
+    job = cloudpickle.loads(blob)
+    t0 = time.perf_counter()
+    result = expand_call(job)
+    return os.getpid(), time.perf_counter() - t0, result
 
 
-def process_jobs(jobs: list[dict[str, Any]], task: str | None = None, n_threads: int = 24) -> list[Any]:
+def process_jobs(
+    jobs: list[dict[str, Any]],
+    task: str | None = None,
+    n_threads: int = 24,
+    on_progress: Callable[[int, float, Any], None] | None = None,
+) -> list[Any]:
     """Ch.20 Snippet 20.9 (`processJobs`) - real `mp.Pool` + `imap_unordered`.
 
     Results arrive in *completion* order, not submission order, which is what
@@ -86,6 +104,18 @@ def process_jobs(jobs: list[dict[str, Any]], task: str | None = None, n_threads:
     is itself a plain module-level function, so it still pickles by reference
     with no dependence on `__main__` spawn fixup.
 
+    `on_progress`, if given, is called as `on_progress(pid, atom_seconds,
+    result)` for every completed job - `pid` identifies which worker process
+    produced it and `atom_seconds` is that job's pure compute time as measured
+    inside the worker, which is what lets a caller (see `orchestrator.run`'s
+    `show_progress`) drive a per-worker live display with real timings. The
+    return value here is unaffected either way - still the plain `list[Any]`
+    of results, never the `(pid, atom_seconds, result)` triples.
+    Supplying `on_progress` means the caller is rendering its own progress
+    display, so the book's own text-based `report_progress` is skipped for
+    that call - the two would otherwise both write to stderr and garble each
+    other's redraws.
+
     Uses explicit close()+join() rather than `with mp.Pool(...) as pool:`,
     whose __exit__ calls terminate() - an abrupt kill, not the book's graceful
     shutdown. The try/finally still lets a job's exception propagate while
@@ -98,9 +128,12 @@ def process_jobs(jobs: list[dict[str, Any]], task: str | None = None, n_threads:
     out: list[Any] = []
     time0 = time.time()
     try:
-        for i, out_ in enumerate(pool.imap_unordered(_run_from_blob, blobs), 1):
+        for i, (pid, atom_s, out_) in enumerate(pool.imap_unordered(_run_from_blob, blobs), 1):
             out.append(out_)
-            report_progress(i, len(jobs), time0, task)
+            if on_progress is not None:
+                on_progress(pid, atom_s, out_)
+            else:
+                report_progress(i, len(jobs), time0, task)
     finally:
         pool.close()
         pool.join()

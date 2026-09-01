@@ -6,12 +6,39 @@ build-backend = "setuptools.build_meta"
 name = "mpengine"
 version = "0.1.0"
 description = "A small, general-purpose multiprocessing engine: dispatch any callable across processes with run manifests, per-worker logs, on-disk outputs and failure isolation"
-requires-python = ">=3.13"
-dependencies = [
-  "numpy>=2.5",
-  "cloudpickle>=3.1",
-  "tqdm>=4.70",
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Amandeep Singh" }]
+keywords = ["multiprocessing", "parallel", "concurrency", "process-pool", "vectorization"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Topic :: System :: Distributed Computing",
 ]
+# Floor is 3.10, not 3.13: `vermin` puts the code itself at 3.9, and the only
+# dependency that would push it higher is numpy - pinned loosely below so pip
+# resolves whatever numpy suits the installing interpreter. A tighter floor
+# just locks out users for no reason.
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "cloudpickle>=3.0",
+  "tqdm>=4.60",
+]
+
+[project.urls]
+Homepage = "https://github.com/singhamandeep-kgp/multiprocessor"
+Repository = "https://github.com/singhamandeep-kgp/multiprocessor"
+Issues = "https://github.com/singhamandeep-kgp/multiprocessor/issues"
 
 # Only `mpengine` is packaged. The `learning` package (src/learning) holds the
 # AFML Ch.20 exercises this engine grew out of - it depends on `statarb` and is

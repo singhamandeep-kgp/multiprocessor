@@ -34,16 +34,25 @@ from mpengine import run
 def my_task(x, y):
     return x * y
 
-summary = run(
-    my_task,
-    [{"x": 2, "y": 3}, {"x": 4, "y": 5}],
-    base_dir="runs",
-)
+if __name__ == "__main__":          # required - see below
+    summary = run(
+        my_task,
+        [{"x": 2, "y": 3}, {"x": 4, "y": 5}],
+        base_dir="runs",
+    )
 
-print(summary.n_ok, summary.n_failed)
-for r in summary.results:
-    print(r.label, r.status, r.output_path or r.error)
+    print(summary.n_ok, summary.n_failed)
+    for r in summary.results:
+        print(r.label, r.status, r.output_path or r.error)
 ```
+
+### The `if __name__ == "__main__":` guard
+
+On Windows and macOS, Python starts worker processes with `spawn`, which
+re-imports your module in every worker. Without the guard, that re-import runs
+your `run(...)` call again in each worker, which spawns more workers, and so on
+until the process dies. Put anything that *calls* `run()` inside the guard;
+your task functions themselves stay at module level, as normal.
 
 ### Placing the outputs
 

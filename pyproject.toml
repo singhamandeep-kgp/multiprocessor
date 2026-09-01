@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mpengine"
-version = "0.1.1"
+version = "0.1.2"
 description = "A small, general-purpose multiprocessing engine: dispatch any callable across processes with run manifests, per-worker logs, on-disk outputs and failure isolation"
 readme = "README.md"
 license = "MIT"

@@ -139,12 +139,8 @@ for triangular workloads — where item `i` costs `O(i)`, such as an
 expanding-window computation — which keeps workers from idling while one
 overloaded worker finishes.
 
-## Provenance
+## What else is in the repo
 
-The dispatch core follows López de Prado, *Advances in Financial Machine
-Learning*, Chapter 20; docstrings name the specific snippets. Nothing in
-`mpengine` is finance-specific.
-
-The `src/learning/` package in this repo holds the exercises the engine grew out
-of. It depends on a separate private project and is deliberately **not**
-packaged — installing `mpengine` elsewhere never pulls it in.
+The `src/learning/` package holds demo and exercise scripts used while
+developing the engine. It depends on a separate private project and is
+deliberately **not** packaged — installing `mpengine` never pulls it in.

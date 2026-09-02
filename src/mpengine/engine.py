@@ -87,10 +87,16 @@ def _run_from_blob(blob: bytes) -> tuple[int, float, Any]:
 def process_jobs(
     jobs: list[dict[str, Any]],
     task: str | None = None,
-    n_threads: int = 24,
+    n_workers: int = os.cpu_count() or 4,
     on_progress: Callable[[int, float, Any], None] | None = None,
 ) -> list[Any]:
     """Ch.20 Snippet 20.9 (`processJobs`) - real `mp.Pool` + `imap_unordered`.
+
+    Named `n_workers`, not `n_threads`: this spawns OS *processes* via
+    `mp.Pool`, each with its own interpreter and memory space, not threads
+    sharing one. That distinction matters here specifically - ex02 measured
+    that CPython's GIL makes threads add nothing for CPU-bound work, which is
+    exactly what this engine dispatches.
 
     Results arrive in *completion* order, not submission order, which is what
     lets `report_progress` report honestly as each job lands - with uneven job
@@ -124,7 +130,13 @@ def process_jobs(
     if task is None:
         task = jobs[0]["func"].__name__
     blobs = [cloudpickle.dumps(job) for job in jobs]
-    pool = mp.Pool(processes=n_threads)
+    # `Pool(processes=n)` spawns exactly n OS processes immediately, whether
+    # or not there's n jobs' worth of work - never spin up more workers than
+    # there are jobs to hand them. This only ever clamps downward: when jobs
+    # outnumber n_workers, no clamp is needed at all - the same fixed pool
+    # keeps pulling jobs off the queue, one per worker at a time, until the
+    # whole list is done. Worker count is sized to hardware, not job count.
+    pool = mp.Pool(processes=min(n_workers, len(jobs)))
     out: list[Any] = []
     time0 = time.time()
     try:

@@ -35,7 +35,7 @@ from typing import Any, Callable
 
 from mpengine.engine import process_jobs, process_jobs_
 
-N_WORKERS = min(os.cpu_count() or 4, 8)
+N_WORKERS = os.cpu_count() or 4
 
 # calibrated so costs span ~30x (0.03s .. 0.87s), submitted heaviest-first so
 # completion order visibly scrambles relative to submission order
@@ -128,7 +128,7 @@ def demo_unordered() -> None:
     print(f"employing {employed} worker process(es) for {len(jobs)} job(s) (N_WORKERS={N_WORKERS})")
     print(f"submission order (end values): {JOB_ENDS}", flush=True)
 
-    out = process_jobs(jobs, n_threads=N_WORKERS)
+    out = process_jobs(jobs, n_workers=N_WORKERS)
     sys.stderr.flush()
 
     print(f"completion order (labels):     {[label for label, _ in out]}")
@@ -159,7 +159,7 @@ def demo_debuggability() -> None:
 
     print(">>> via process_jobs (pool):", flush=True)
     try:
-        out = process_jobs(jobs, n_threads=N_WORKERS)
+        out = process_jobs(jobs, n_workers=N_WORKERS)
         print(f"  (unexpectedly succeeded: {out})")
     except Exception:
         traceback.print_exc()
@@ -178,7 +178,7 @@ def demo_mixed_callbacks() -> None:
     print(f"{len(jobs)} jobs: 2x sum_of_squares(int, int)->int, 2x char_histogram(str, int)->dict")
     print("one job list, one process_jobs call, two unrelated signatures\n", flush=True)
 
-    out = process_jobs(jobs, task="mixed", n_threads=N_WORKERS)
+    out = process_jobs(jobs, task="mixed", n_workers=N_WORKERS)
     sys.stderr.flush()
 
     for label, value in out:

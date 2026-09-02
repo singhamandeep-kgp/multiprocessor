@@ -93,7 +93,7 @@ run with a custom `save_fn`, pass the matching reader as
 | `save_fn` | how each result is written. Default `save_pickle`; supply your own (e.g. parquet) |
 | `labels` | names for each job; defaults to `job_0000`, `job_0001`, … |
 | `task` | names the run; defaults to `func.__name__` |
-| `n_threads` | worker count; defaults to `min(cpu_count, 8)` |
+| `n_workers` | worker *process* count (not threads — see below); defaults to `os.cpu_count()`, clamped down to the number of jobs if there are fewer jobs than that |
 | `debug` | run sequentially in-process — real tracebacks you can attach a debugger to, no pool |
 | `show_progress` | live terminal display: one overall bar for the whole run, plus a live rate number per worker process. Ignored when `debug=True` |
 
@@ -121,7 +121,7 @@ you want to drive the pool yourself:
 from mpengine import expand_call, process_jobs, process_jobs_
 
 jobs = [{"func": my_task, "x": 1, "y": 2}, {"func": other_task, "n": 5}]
-results = process_jobs(jobs, n_threads=8)     # or process_jobs_ to stay sequential
+results = process_jobs(jobs)     # n_workers defaults to os.cpu_count(); or process_jobs_ to stay sequential
 ```
 
 A job is just a dict carrying its own callback plus that callback's kwargs, so a

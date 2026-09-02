@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mpengine"
-version = "0.1.2"
+version = "0.2.0"
 description = "A small, general-purpose multiprocessing engine: dispatch any callable across processes with run manifests, per-worker logs, on-disk outputs and failure isolation"
 readme = "README.md"
 license = "MIT"
@@ -49,11 +49,11 @@ Issues = "https://github.com/singhamandeep-kgp/multiprocessor/issues"
 where = ["src"]
 include = ["mpengine*"]
 
-# worker_names.json is data, not code - setuptools' package discovery above
-# only picks up .py files by default, so it needs to be listed explicitly to
-# actually ship inside a built wheel.
+# worker_names.json and spider.txt are data, not code - setuptools' package
+# discovery above only picks up .py files by default, so they need listing
+# explicitly to actually ship inside a built wheel.
 [tool.setuptools.package-data]
-mpengine = ["worker_names.json"]
+mpengine = ["worker_names.json", "spider.txt"]
 
 # `statarb` (needed only by src/learning) is installed separately as an editable
 # path install (pip install -e ../Equity_StatArb) rather than declared here,

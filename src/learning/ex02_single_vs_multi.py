@@ -32,7 +32,7 @@ from learning.timing import print_table, time_runs
 N_SECURITIES = 1200
 MIN_OBS = 2000
 WINDOW = 20
-N_WORKERS = min(os.cpu_count() or 4, 8)
+N_WORKERS = os.cpu_count() or 4
 
 
 # -- the atom, two ways -------------------------------------------------------

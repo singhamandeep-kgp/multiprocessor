@@ -37,9 +37,10 @@ from typing import Any, Callable, Iterator
 
 from tqdm import tqdm
 
+from mpengine.banner import print_banner
 from mpengine.engine import expand_call, process_jobs, process_jobs_
 
-N_WORKERS = min(os.cpu_count() or 4, 8)
+N_WORKERS = os.cpu_count() or 4
 
 # one FileHandler-backed logger per worker *process*, lazily created on that
 # process's first job and reused for every job after - keyed by pid, which is
@@ -302,7 +303,7 @@ def run(
     save_fn: Callable[[Any, Path], None] = save_pickle,
     labels: list[str] | None = None,
     task: str | None = None,
-    n_threads: int = N_WORKERS,
+    n_workers: int = N_WORKERS,
     debug: bool = False,
     show_progress: bool = False,
 ) -> RunSummary:
@@ -385,7 +386,7 @@ def run(
         f.write(f"launched: {dt.datetime.now().isoformat(sep=' ', timespec='seconds')}\n")
         f.write(f"func: {func.__name__}\n")
         f.write(f"task: {task}\n")
-        f.write(f"n_threads: {n_threads}\n")
+        f.write(f"n_workers: {n_workers}\n")
         f.write(f"debug: {debug}\n")
         f.write(f"n_jobs: {len(jobs)}\n")
         f.write(f"output_dir: {output_path}\n")
@@ -397,14 +398,16 @@ def run(
 
     worker_stats: dict[int, WorkerStats] = {}
 
+    print_banner(task, n_workers, debug)
+
     t0 = time.perf_counter()
     if debug:
         raw_results = process_jobs_(jobs)
     elif show_progress:
         with _progress_renderer(len(jobs), task, worker_stats) as on_progress:
-            raw_results = process_jobs(jobs, task=task, n_threads=n_threads, on_progress=on_progress)
+            raw_results = process_jobs(jobs, task=task, n_workers=n_workers, on_progress=on_progress)
     else:
-        raw_results = process_jobs(jobs, task=task, n_threads=n_threads)
+        raw_results = process_jobs(jobs, task=task, n_workers=n_workers)
     elapsed_s = time.perf_counter() - t0
 
     if show_progress and not debug:

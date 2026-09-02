@@ -34,7 +34,7 @@ from learning.timing import print_table, time_runs
 
 TICKER = "AAPL"
 N = 7500
-N_WORKERS = min(os.cpu_count() or 4, 8)
+N_WORKERS = os.cpu_count() or 4
 
 
 # -- the atom, two ways --------------------------------------------------------

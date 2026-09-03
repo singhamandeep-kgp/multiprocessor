@@ -174,6 +174,11 @@ for triangular workloads — where item `i` costs `O(i)`, such as an
 expanding-window computation — which keeps workers from idling while one
 overloaded worker finishes.
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md). Versions below 1.0 may carry breaking changes
+in a minor release; each is listed there with the migration needed.
+
 ## What else is in the repo
 
 The `src/learning/` package holds demo and exercise scripts used while

@@ -49,7 +49,14 @@ import logging as _logging
 # or silenced on its own.
 _logging.getLogger("mpengine").addHandler(_logging.NullHandler())
 
-from mpengine.engine import expand_call, process_jobs, process_jobs_, report_progress
+from mpengine.engine import (
+    BroadcastRef,
+    expand_call,
+    process_jobs,
+    process_jobs_,
+    report_progress,
+    shutdown_pools,
+)
 from mpengine.orchestrator import (
     JobResult,
     RunSummary,
@@ -76,6 +83,9 @@ __all__ = [
     "process_jobs",
     "process_jobs_",
     "report_progress",
+    # sending one large shared payload per worker instead of per job
+    "BroadcastRef",
+    "shutdown_pools",
     # atom -> molecule partitioning
     "equal_chunks",
     "lin_parts",
@@ -83,4 +93,4 @@ __all__ = [
     "parts_to_molecules",
 ]
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"

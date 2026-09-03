@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mpengine"
-version = "0.3.1"
+version = "0.4.0"
 description = "A small, general-purpose multiprocessing engine: dispatch any callable across processes with run manifests, per-worker logs, on-disk outputs and failure isolation"
 readme = "README.md"
 license = "MIT"
@@ -33,6 +33,12 @@ dependencies = [
   "numpy>=1.26",
   "cloudpickle>=3.0",
   "tqdm>=4.60",
+  # Caps each worker's native BLAS thread count from inside the worker. The
+  # environment variables mpengine sets in the parent already cover `spawn`,
+  # but under `fork` the child inherits an already-loaded OpenBLAS/MKL and
+  # only a runtime re-limit like this one reaches it. Pure Python, no
+  # transitive dependencies.
+  "threadpoolctl>=3.0",
 ]
 
 [project.urls]

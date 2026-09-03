@@ -39,7 +39,13 @@ from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 from mpengine.banner import print_banner
-from mpengine.engine import expand_call, process_jobs, process_jobs_
+from mpengine.engine import (
+    BroadcastRef,
+    expand_call,
+    install_broadcast,
+    process_jobs,
+    process_jobs_,
+)
 
 N_WORKERS = os.cpu_count() or 4
 
@@ -282,6 +288,33 @@ def _validate_labels(labels: list[str]) -> None:
         )
 
 
+def _validate_broadcast(
+    broadcast: dict[str, Any], param_sets: list[dict[str, Any]]
+) -> None:
+    """Reject a broadcast payload that cannot be delivered unambiguously.
+
+    A broadcast value reaches the caller's function as a keyword argument, so
+    its key has to be a usable one, and it must not collide with a key that
+    `param_sets` already supplies - a job carrying both would be two competing
+    values for one parameter, and silently picking either is worse than saying
+    so. Checked here, before any directory is created, per the same
+    validation-precedes-side-effects rule as `_validate_labels`.
+    """
+    bad = [k for k in broadcast if not isinstance(k, str) or not k.isidentifier()]
+    if bad:
+        raise ValueError(
+            "broadcast keys are passed to your function as keyword arguments, so "
+            "each must be a valid Python identifier - these are not: "
+            + ", ".join(repr(k) for k in bad)
+        )
+    clashing = sorted({k for params in param_sets for k in params} & set(broadcast))
+    if clashing:
+        raise ValueError(
+            "these keys are in both broadcast and param_sets, so each job would "
+            f"get two values for one argument: {', '.join(repr(k) for k in clashing)}"
+        )
+
+
 def _get_worker_logger(log_dir: Path) -> logging.Logger:
     global _worker_logger, _worker_log_dir
     if _worker_logger is not None and _worker_log_dir == log_dir:
@@ -503,6 +536,13 @@ def run(
     debug: bool = False,
     show_progress: bool = False,
     text_progress: bool | None = None,
+    blas_threads: int | str | None = "auto",
+    chunksize: int | str = "auto",
+    broadcast: dict[str, Any] | None = None,
+    initializer: Callable[..., None] | None = None,
+    initargs: tuple[Any, ...] = (),
+    reuse_pool: bool = False,
+    max_tasks_per_child: int | None = None,
 ) -> RunSummary:
     """Run `func(**params)` for every dict in `param_sets`, organized.
 
@@ -535,6 +575,35 @@ def run(
     keeps today's behaviour - on when interactive, off otherwise). Force it
     to `False` if you're watching per-job DEBUG/INFO logging instead: the two
     would otherwise both write to the terminal and visually clash.
+
+    Performance
+    -----------
+    `broadcast` is the one to reach for first when jobs share a large object.
+    Anything a job would otherwise capture in a closure - a price panel, a
+    fitted model - goes here instead, is serialized once, and is delivered to
+    each *worker* rather than travelling with each *job*::
+
+        run(score, param_sets, base_dir="runs", broadcast={"panel": panel})
+
+    `score` is then called as `score(**params, panel=panel)`. A key here may
+    not also appear in `param_sets`. Pair it with `reuse_pool=True` whenever
+    you call `run()` more than once with the same payload - the panel is then
+    delivered once for the life of the pool instead of once per call, which
+    for a 80 MB panel over 200 jobs is 0.62s against 8.93s. On a single cold
+    call with a payload under ~10 MB, plain closure capture is if anything
+    slightly faster; `engine.process_jobs` documents the crossover in full.
+
+    `blas_threads` caps the threads each worker's native BLAS may use for one
+    numpy call; `'auto'` is `cpu_count // workers`, so parallelism comes from
+    this engine rather than from every worker's BLAS separately trying to
+    seize the whole machine (measured 9.5x on SVD-heavy jobs). `chunksize`
+    is how many jobs travel per submission, `'auto'` by default and collapsing
+    to 1 on small runs so a live display keeps per-job granularity.
+    `initializer`/`initargs` run once per worker before its first job and may
+    be closures. `reuse_pool=True` keeps the pool (and its broadcast payload)
+    alive between calls, worth ~280 ms per call in a loop; `max_tasks_per_child`
+    recycles a worker periodically on Python 3.11+. All are passed straight
+    through to `engine.process_jobs`, which documents them in full.
     """
     if base_dir is not None:
         base = Path(base_dir)
@@ -568,6 +637,8 @@ def run(
     if len(labels) != len(param_sets):
         raise ValueError(f"got {len(labels)} labels for {len(param_sets)} param sets")
     _validate_labels(labels)
+    if broadcast:
+        _validate_broadcast(broadcast, param_sets)
 
     # Microseconds, not seconds. At second resolution two runs of the same task
     # inside one second produced an identical run_id, and because the
@@ -583,6 +654,12 @@ def run(
     Path(manifest_dir).mkdir(parents=True, exist_ok=True)
     manifest_path = Path(manifest_dir) / f"{run_id}.txt"
 
+    # Broadcast values go into the INNER job as lightweight references, never
+    # as the objects themselves - that is the whole point, since the inner job
+    # is what gets cloudpickled per job. `engine.expand_call` swaps each
+    # reference for the real payload inside the worker, where the pool
+    # initializer has already installed it exactly once.
+    refs = {key: BroadcastRef(key) for key in (broadcast or {})}
     jobs = [
         {
             "func": _run_and_save_job,
@@ -591,7 +668,7 @@ def run(
                 "output_dir": output_path,
                 "log_dir": log_path,
                 "save_fn": save_fn,
-                "inner_job": {"func": func, **params},
+                "inner_job": {"func": func, **params, **refs},
             },
         }
         for label, params in zip(labels, param_sets)
@@ -686,8 +763,36 @@ def run(
                 "(logging milestones instead)", run_id,
             )
 
+        # Everything the engine needs to build and feed the pool. Collected
+        # once so the three dispatch branches below cannot drift apart.
+        dispatch_kwargs: dict[str, Any] = {
+            "task": task,
+            "n_workers": n_workers,
+            "on_job_error": on_job_error,
+            "blas_threads": blas_threads,
+            "chunksize": chunksize,
+            "broadcast": broadcast,
+            # The references were placed on the INNER job above, where the
+            # caller's own function is - letting the engine add them to the
+            # outer job as well would hand `_run_and_save_job` a keyword
+            # argument it has no parameter for.
+            "inject_broadcast": False,
+            "initializer": initializer,
+            "initargs": initargs,
+            "reuse_pool": reuse_pool,
+            "max_tasks_per_child": max_tasks_per_child,
+        }
+
         t0 = time.perf_counter()
         if debug:
+            # No pool means no pool initializer, so the two things it would
+            # have done once per worker have to happen here instead - this
+            # process IS the worker in debug mode, and without the payload
+            # installed the BroadcastRefs in each job resolve against nothing.
+            if broadcast:
+                install_broadcast(broadcast)
+            if initializer is not None:
+                initializer(*initargs)
             raw_results = process_jobs_(jobs)
             for r in raw_results:
                 log_job(os.getpid(), 0.0, r)
@@ -706,12 +811,13 @@ def run(
                     render(pid, atom_s, result)
 
                 raw_results = process_jobs(
-                    jobs, task=task, n_workers=n_workers,
-                    on_progress=on_progress, on_job_error=on_job_error,
+                    jobs,
+                    on_progress=on_progress,
                     text_progress=False,
                     # The tqdm bar above already shows aggregate progress -
                     # the engine's own milestone logging would just repeat it.
                     milestones=False,
+                    **dispatch_kwargs,
                 )
         else:
             # `text_progress=None` keeps the existing default (the book's
@@ -724,9 +830,10 @@ def run(
                 else (not show_progress) and interactive
             )
             raw_results = process_jobs(
-                jobs, task=task, n_workers=n_workers,
-                on_progress=log_job, on_job_error=on_job_error,
+                jobs,
+                on_progress=log_job,
                 text_progress=effective_text_progress,
+                **dispatch_kwargs,
             )
         elapsed_s = time.perf_counter() - t0
 

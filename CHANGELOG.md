@@ -7,6 +7,79 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the
 version is below 1.0, breaking changes may land in a minor release — each one
 is called out under **Breaking** with the migration needed.
 
+## [0.4.0] — 2026-09-03
+
+A performance release, and the first time mpengine's speed was measured rather
+than assumed. Benchmarked against joblib 1.5.3 on 8 cores with OpenBLAS, four
+distinct dispatch costs turned out to be avoidable. Everything here is
+additive — no call that worked in 0.3.1 changes behaviour, other than by
+getting faster.
+
+The benchmarks are committed at `benchmarks/bench.py` and keep the "before"
+path runnable (each optimization can be switched back off), so the comparison
+is reproducible rather than a remembered number.
+
+### Added
+
+- **`blas_threads`** — caps how many threads each worker's native BLAS may use
+  for a single numpy call. Default `'auto'` = `cpu_count // n_pool`, resolved
+  after the worker-count clamp so it divides by the jobs actually running
+  concurrently: 8 workers on 8 cores get 1 thread each, 2 workers get 4 each.
+  Without it every worker loads its own OpenBLAS, each believing it owns the
+  machine — 8 processes × 8 threads contending for 8 cores. **24 SVD jobs:
+  8.26s → 1.20s (6.9×).** Applied both by environment variable in the parent
+  (which is what reaches a `spawn`ed child) and by `threadpoolctl` inside the
+  worker (which is what reaches a `fork`ed one, where the library is already
+  loaded). Pass an int for an explicit budget, or `None` to disable.
+- **`chunksize`** — jobs per submission, default `'auto'`. Previously every job
+  cost its own IPC round-trip and future. `'auto'` collapses to 1 on small runs,
+  so a live per-job display is untouched where a human can follow it.
+  **20,000 trivial jobs: 5.55s → 1.01s (5.5×).**
+- **`broadcast`** — ships a shared payload once per *worker* rather than once
+  per job, delivered by the pool initializer and resolved inside the worker, so
+  the caller's function just receives it as a keyword argument. **200 jobs
+  sharing an 80 MB panel: 7.97s → 3.07s, and 0.55s with `reuse_pool=True`
+  (14×) — on par with joblib's memmapped 0.58s.** Documented honestly: on a *cold*
+  pool with a payload under ~10 MB it is a small loss, because batching already
+  reduces a closure-captured payload to one copy per batch. Pair it with
+  `reuse_pool` and the crossover disappears.
+- **`initializer` / `initargs`** — run once per worker before its first job.
+  Unlike the stdlib's, these may be closures or lambdas.
+- **`reuse_pool`** and **`max_tasks_per_child`** — keep the executor (and its
+  broadcast payload) alive between calls instead of rebuilding it each time.
+  Pool construction costs ~1s on this machine, paid on every previous call:
+  **10 back-to-back dispatches: 9.86s → 0.02s, ~984 ms saved per call.**
+  Default **off**: a persistent worker carries state between runs, and that is
+  the one change here with a plausible subtle failure mode. `shutdown_pools()`
+  tears them down, and is registered with `atexit`.
+- `BroadcastRef` and `shutdown_pools` are exported from the package root.
+- `threadpoolctl>=3.0` is a new dependency — pure Python, no transitive deps.
+
+### Changed
+
+- **Jobs are serialized one batch at a time, not one job at a time.** 0.3.1
+  called `cloudpickle.dumps` per job so that an unpicklable payload could be
+  named by index; on 20,000 jobs that error path cost more than the dispatch
+  it protected. Now the batch is dumped in one call, and only a batch that
+  actually fails is re-walked job by job to find the culprit. Per-job
+  attribution via `on_job_error` is unchanged — verified with an unpicklable
+  job mid-batch: its four batch-mates still ran and it was still reported as
+  exactly `job_0007`.
+- The worker count is now clamped against the jobs that survived
+  serialization rather than the jobs submitted, so jobs dropped by
+  `on_job_error` can no longer leave workers idle.
+- Progress milestones count jobs rather than futures, so a batched run reports
+  `done=12000/20000` and not `done=12/20`.
+
+### Unchanged, and verified so
+
+Per-job `atom_seconds` is still measured around each individual call inside the
+worker, and `on_progress` still fires once per job — a batch is unpacked in the
+parent before anything downstream sees it, so the live per-worker display and
+`WorkerStats` are unaffected. The dead-worker detection, the terminal/production
+logging split, and per-worker log files across a reused pool were each
+re-checked against this release.
+
 ## [0.3.1] — 2026-09-03
 
 Refines the terminal/logging split 0.3.0 introduced, based on actually running
@@ -163,6 +236,7 @@ logs, on-disk results and per-job failure isolation, `lin_parts`/`nested_parts`
 partitioning, closure and lambda support via `cloudpickle`, and a live
 per-worker progress display.
 
+[0.4.0]: https://github.com/singhamandeep-kgp/multiprocessor/releases/tag/v0.4.0
 [0.3.1]: https://github.com/singhamandeep-kgp/multiprocessor/releases/tag/v0.3.1
 [0.3.0]: https://github.com/singhamandeep-kgp/multiprocessor/releases/tag/v0.3.0
 [0.2.0]: https://github.com/singhamandeep-kgp/multiprocessor/releases/tag/v0.2.0

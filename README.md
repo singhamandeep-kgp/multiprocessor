@@ -102,6 +102,44 @@ Develop with `debug=True`, then flip it off. Chasing a bug through a process
 pool means reading a traceback re-raised from a worker that has already exited,
 and it never tells you which job dict was at fault.
 
+### Performance
+
+The defaults are already tuned; these are the knobs for when they aren't
+enough. Measured on 8 cores with OpenBLAS against joblib 1.5.3 — reproduce
+with `python benchmarks/bench.py`, which keeps each "before" path runnable
+rather than quoting a remembered number.
+
+| argument | meaning | measured |
+|---|---|---|
+| `blas_threads` | threads each worker's native BLAS may use for one numpy call. `'auto'` = `cpu_count // workers`; an int to set it; `None` to disable | 24 SVD jobs **8.26s → 1.20s** |
+| `chunksize` | jobs per submission. `'auto'` batches large runs and collapses to 1 on small ones | 20,000 tiny jobs **5.55s → 1.01s** |
+| `broadcast` | a `dict` of values shipped once per *worker* instead of once per job, delivered to your function as keyword arguments | 200 jobs + 80 MB panel **7.97s → 0.55s** |
+| `reuse_pool` | keep the pool (and its broadcast payload) alive between calls instead of rebuilding it. Off by default | 10 dispatches **9.86s → 0.02s** |
+| `initializer`, `initargs` | run once per worker before its first job — and unlike the stdlib's, may be a closure | — |
+| `max_tasks_per_child` | recycle a worker every N jobs, so a slow leak can't end the run (Python 3.11+) | — |
+
+**BLAS threads** is the one that catches people out. numpy hands matrix work to
+a native library that is itself multi-threaded, and each worker process loads
+its own copy believing it owns the machine — so eight workers each spawn eight
+BLAS threads and 64 threads fight over 8 cores. Capping them means parallelism
+comes from mpengine, one job per core, instead. This is on by default.
+
+**Broadcast** is for the panel or fitted model every job needs:
+
+```python
+summary = run(score, param_sets, base_dir="runs",
+              broadcast={"panel": panel}, reuse_pool=True)
+```
+
+`score` is then called as `score(**params, panel=panel)`. Worth being precise
+about when it pays: batching alone already reduces a closure-captured payload
+to one copy per batch, so on a single cold call with a payload under ~10 MB,
+broadcast costs slightly more than it saves. Above that, or paired with
+`reuse_pool=True` where the payload is delivered once for the life of the pool,
+it is a different order of magnitude — 0.55s on the 80 MB case, level with
+joblib's memmapped 0.58s. Call `shutdown_pools()` when you're done with a
+reused pool, or let `atexit` do it.
+
 ### Logging
 
 The library logs its whole lifecycle through the standard `logging` module and

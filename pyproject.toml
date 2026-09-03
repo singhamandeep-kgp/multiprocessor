@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mpengine"
-version = "0.4.0"
+version = "0.4.1"
 description = "A small, general-purpose multiprocessing engine: dispatch any callable across processes with run manifests, per-worker logs, on-disk outputs and failure isolation"
 readme = "README.md"
 license = "MIT"
@@ -23,6 +23,7 @@ classifiers = [
   "Programming Language :: Python :: 3.14",
   "Topic :: Software Development :: Libraries :: Python Modules",
   "Topic :: System :: Distributed Computing",
+  "Typing :: Typed",
 ]
 # Floor is 3.10, not 3.13: `vermin` puts the code itself at 3.9, and the only
 # dependency that would push it higher is numpy - pinned loosely below so pip
@@ -40,6 +41,19 @@ dependencies = [
   # transitive dependencies.
   "threadpoolctl>=3.0",
 ]
+
+[project.optional-dependencies]
+# Everything needed to run `pytest` and `benchmarks/bench.py`. joblib is the
+# benchmark's comparison target, not a runtime dependency of the library.
+test = ["pytest>=7.0", "joblib>=1.3"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Process-pool tests dominate the runtime, so they are marked rather than
+# hidden: a plain `pytest` runs everything, `pytest -m "not slow"` is the
+# fast inner loop.
+markers = ["slow: spawns real process pools; deselect with -m 'not slow'"]
+filterwarnings = ["error::DeprecationWarning:mpengine.*"]
 
 [project.urls]
 Homepage = "https://github.com/singhamandeep-kgp/multiprocessor"
@@ -59,7 +73,7 @@ include = ["mpengine*"]
 # discovery above only picks up .py files by default, so they need listing
 # explicitly to actually ship inside a built wheel.
 [tool.setuptools.package-data]
-mpengine = ["worker_names.json", "spider.txt"]
+mpengine = ["worker_names.json", "spider.txt", "py.typed"]
 
 # `statarb` (needed only by src/learning) is installed separately as an editable
 # path install (pip install -e ../Equity_StatArb) rather than declared here,

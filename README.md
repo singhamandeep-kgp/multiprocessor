@@ -1,5 +1,7 @@
 # mpengine
 
+[![CI](https://github.com/singhamandeep-kgp/multiprocessor/actions/workflows/ci.yml/badge.svg)](https://github.com/singhamandeep-kgp/multiprocessor/actions/workflows/ci.yml)
+
 *(This repo is named `multiprocessor`; the package it ships is `mpengine` — see below.)*
 
 A small, general-purpose multiprocessing engine. Give it any callable and a list
@@ -211,6 +213,25 @@ from mpengine import lin_parts, nested_parts, parts_to_molecules
 for triangular workloads — where item `i` costs `O(i)`, such as an
 expanding-window computation — which keeps workers from idling while one
 overloaded worker finishes.
+
+## Tests
+
+```bash
+pip install -e ".[test]"
+pytest                    # everything, ~30s
+pytest -m "not slow"      # skip the process-pool tests, under a second
+```
+
+576 tests. The ones that spawn real pools are marked `slow` and dominate the
+runtime, so the marker exists to keep a fast inner loop available - but they
+run by default, because the behaviour they cover (a dead worker surfacing
+instead of hanging, per-job failure attribution inside a batch, BLAS budgets
+read back from inside a worker) is exactly the behaviour worth guarding.
+
+CI runs the suite on Linux, Windows and macOS across Python 3.10, 3.12 and
+3.14. The platform spread matters here: Windows and macOS start workers with
+`spawn`, Linux does not, and mpengine caps BLAS threads by a different
+mechanism in each case.
 
 ## Changelog
 

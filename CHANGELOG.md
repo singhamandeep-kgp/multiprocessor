@@ -7,6 +7,46 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the
 version is below 1.0, breaking changes may land in a minor release — each one
 is called out under **Breaking** with the migration needed.
 
+## [0.4.1] — 2026-09-03
+
+The first test suite, CI, and the bug the suite found on its way in.
+
+### Added
+
+- **576 tests**, run with `pytest`. Process-pool tests are marked `slow`, so
+  `pytest` runs everything (~30s) and `pytest -m "not slow"` is a sub-second
+  inner loop (~520 tests). Install them with `pip install -e ".[test]"`.
+  Coverage is behaviour-first rather than line-first: the dead-worker
+  detection, the empty-molecule regression swept across a grid of inputs,
+  per-job failure attribution inside a batch, BLAS budgets read back from
+  inside real worker processes, executor reuse and eviction of a broken pool,
+  atomic saves, label and broadcast validation, and the whole terminal/
+  production logging split.
+- **CI on GitHub Actions** across Linux, Windows and macOS on Python 3.10,
+  3.12 and 3.14, plus a job that builds the wheel and installs it into a clean
+  virtualenv. The platform spread is not decoration: Windows and macOS start
+  workers with `spawn`, where the BLAS environment variables mpengine sets in
+  the parent are what reach the child, while Linux does not — there the child
+  inherits an already-loaded OpenBLAS and only the `threadpoolctl` call inside
+  the worker can constrain it. Those are two different code paths, and until
+  now only one of them had ever been executed.
+- **A `py.typed` marker.** The library was already fully annotated but shipped
+  no types, so every downstream type checker treated it as untyped.
+
+### Fixed
+
+- **A lambda or other awkwardly-named target no longer produces an invalid
+  run directory.** 0.3.1 claimed this was fixed; it was not. That fix only
+  covered callables with *no* `__name__` — `functools.partial` and callable
+  objects — but a lambda's `__name__` is literally `'<lambda>'`, which is a
+  perfectly truthy string, so it passed straight through into a directory
+  name. `<` and `>` are illegal in Windows filenames, so `run(lambda x: ...)`
+  died with `WinError 123` before a single job ran. Task names are now
+  sanitised for filesystem use (path separators, the Windows-illegal set,
+  control characters, and reserved device names like `con` and `LPT1`), while
+  the manifest keeps the original: a lambda still records as `func: <lambda>`
+  and runs in a directory called `lambda_<timestamp>`.
+
 ## [0.4.0] — 2026-09-03
 
 A performance release, and the first time mpengine's speed was measured rather
@@ -236,6 +276,7 @@ logs, on-disk results and per-job failure isolation, `lin_parts`/`nested_parts`
 partitioning, closure and lambda support via `cloudpickle`, and a live
 per-worker progress display.
 
+[0.4.1]: https://github.com/singhamandeep-kgp/multiprocessor/releases/tag/v0.4.1
 [0.4.0]: https://github.com/singhamandeep-kgp/multiprocessor/releases/tag/v0.4.0
 [0.3.1]: https://github.com/singhamandeep-kgp/multiprocessor/releases/tag/v0.3.1
 [0.3.0]: https://github.com/singhamandeep-kgp/multiprocessor/releases/tag/v0.3.0

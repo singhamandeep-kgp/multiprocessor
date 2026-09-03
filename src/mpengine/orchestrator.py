@@ -26,6 +26,7 @@ import logging
 import os
 import pickle
 import random
+import re
 import sys
 import time
 import traceback
@@ -286,6 +287,40 @@ def _validate_labels(labels: list[str]) -> None:
             "labels must be unique - each one names an output file, so duplicates "
             f"would overwrite each other: {', '.join(repr(d) for d in dupes)}"
         )
+
+
+# Characters no Windows filename may contain, plus the control range. POSIX
+# only forbids "/" and NUL, but a run directory should be portable - a run
+# recorded on Linux and read back on Windows is an ordinary thing to want.
+_UNSAFE_PATH_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
+
+# Windows refuses these as filenames outright, whatever the extension, because
+# they name devices. A function called `con` or `aux` is unusual but the
+# failure it would cause is baffling, and guarding it costs nothing.
+_RESERVED_NAMES = frozenset(
+    ["con", "prn", "aux", "nul"]
+    + [f"com{i}" for i in range(1, 10)]
+    + [f"lpt{i}" for i in range(1, 10)]
+)
+
+
+def _safe_task_name(task: str) -> str:
+    """Make a task name usable as a directory name.
+
+    The task names a run, and the run names three directories, so whatever
+    lands here has to survive `mkdir`. The case that actually bites is a
+    lambda: `func.__name__` for one is literally `'<lambda>'`, and `<` and `>`
+    are illegal in Windows filenames, so an unnamed target used to fail with
+    WinError 123 before a single job ran. Degrading to the *type* name does
+    not help there - a lambda is a `function`, and it has a `__name__`, so
+    nothing about it is missing. The name simply needs cleaning.
+    """
+    cleaned = _UNSAFE_PATH_CHARS.sub("_", str(task)).strip(" ._")
+    if not cleaned:
+        return "job"
+    if cleaned.lower() in _RESERVED_NAMES:
+        return f"{cleaned}_task"
+    return cleaned
 
 
 def _validate_broadcast(
@@ -628,7 +663,10 @@ def run(
     # `func.__name__` is not safe: a functools.partial or a callable object -
     # both of which this engine explicitly supports - has no __name__.
     func_name = getattr(func, "__name__", None) or type(func).__name__ or "job"
-    task = task or func_name
+    # Sanitised because the task names three directories. `func_name` keeps the
+    # original for the manifest, so a lambda still records as `<lambda>` there
+    # while its run directory is called `lambda_<timestamp>`.
+    task = _safe_task_name(task or func_name)
 
     # Everything above and below this point is validation; no directory,
     # manifest or banner is produced until it all passes, so a rejected call

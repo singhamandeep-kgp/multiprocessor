@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Never stop the other jobs because one combination failed - for a
+      # library whose behaviour genuinely differs by platform, knowing that
+      # only Windows broke is most of the diagnosis.
+      fail-fast: false
+      matrix:
+        # The operating systems are not interchangeable here. Windows and
+        # macOS start workers with `spawn` (a fresh interpreter, which reads
+        # the BLAS environment variables mpengine sets); Linux does not, so
+        # the child inherits an already-loaded OpenBLAS and only the
+        # threadpoolctl call inside the worker can constrain it. Those are two
+        # different code paths, and only one of them can be tested locally.
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.10", "3.12", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+
+      - name: Show the multiprocessing start method
+        # Recorded per job because it is what decides which half of the BLAS
+        # governance is doing the work, and it changes between Python versions
+        # (3.14 moved Linux off plain `fork`).
+        run: python -c "import multiprocessing as m, sys; print(sys.version); print('start method:', m.get_start_method())"
+
+      - name: Test
+        run: python -m pytest -v --durations=10
+
+  build:
+    name: Build and check the distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+
+      - name: Check metadata
+        run: python -m twine check dist/*
+
+      - name: Verify the wheel installs and imports cleanly
+        # A wheel that builds is not the same as a wheel that works: this is
+        # what catches package-data (spider.txt, worker_names.json) going
+        # missing, which a source-tree test run would never notice.
+        run: |
+          python -m venv /tmp/fresh
+          /tmp/fresh/bin/python -m pip install dist/*.whl
+          /tmp/fresh/bin/python -c "import mpengine; print(mpengine.__version__); print(mpengine.run)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

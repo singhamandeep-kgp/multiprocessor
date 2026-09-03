@@ -1,0 +1,3 @@
+# Marker file (PEP 561): mpengine is fully annotated, so type checkers in
+# downstream projects should read these annotations rather than treating the
+# package as untyped.

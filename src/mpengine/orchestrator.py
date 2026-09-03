@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 from mpengine.banner import print_banner
 from mpengine.engine import expand_call, process_jobs, process_jobs_
@@ -48,6 +49,66 @@ N_WORKERS = os.cpu_count() or 4
 # who want to see this call logging.basicConfig(level=logging.INFO). The
 # spider banner is the one deliberate exception and still prints.
 _log = logging.getLogger("mpengine.orchestrator")
+# See the matching note on "mpengine.engine" in engine.py: lifecycle logging
+# is always captured in run.log but never bubbles up to the caller's own
+# logging setup, so configuring logging for unrelated reasons doesn't also
+# surface mpengine's internal chatter.
+_log.propagate = False
+
+# A separate logger, and deliberately NOT a child of "mpengine.orchestrator"
+# (it sits directly under "mpengine" instead) - for the "what happened, where
+# did it land" summary a person watching a terminal actually wants: the
+# stored-here paths and the worker ranking. Kept apart from `_log` for two
+# reasons: `_log` also carries dispatch-lifecycle chatter that would show up
+# too if a handler were attached to it directly, and `_log.propagate = False`
+# above would otherwise also cut this logger off from the caller's own
+# logging setup, were it a child of `_log`. These are real `logging` calls
+# throughout, never a print() dressed up to look like one -
+# `_terminal_summary_handler` below is what makes them visible on an
+# interactive terminal without the caller configuring anything, and normal
+# propagation is what makes them visible via the caller's own setup too.
+_summary_log = logging.getLogger("mpengine.summary")
+
+
+def _has_external_handler() -> bool:
+    """Whether the caller has configured logging somewhere that would already
+    show these records - `logging.basicConfig()` (attaches to root) or a
+    handler attached directly to `mpengine`. If so, leave it alone entirely
+    rather than risk showing anything twice or fighting the caller's own
+    formatting."""
+    if logging.getLogger().handlers:
+        return True
+    return any(
+        not isinstance(h, logging.NullHandler)
+        for h in logging.getLogger("mpengine").handlers
+    )
+
+
+@contextmanager
+def _terminal_summary_handler(interactive: bool) -> Iterator[None]:
+    """Make `_summary_log` visible on an interactive terminal with zero
+    configuration, for the duration of one run.
+
+    Only ever active when `interactive` is True AND the caller has not
+    configured logging themselves (`_has_external_handler`) - prod stays
+    exactly as silent as the caller's own logging setup dictates, and a
+    caller who has taken control of logging is never overridden. Attached and
+    removed per run, mirroring `_run_log_file`, so nothing leaks across calls.
+    """
+    if not interactive or _has_external_handler():
+        yield
+        return
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(levelname)-7s %(name)s: %(message)s"))
+    previous_level = _summary_log.level
+    _summary_log.setLevel(logging.INFO)
+    _summary_log.addHandler(handler)
+    try:
+        yield
+    finally:
+        _summary_log.removeHandler(handler)
+        handler.close()
+        _summary_log.setLevel(previous_level)
 
 # one FileHandler-backed logger per worker *process*, lazily created on that
 # process's first job and reused for every job after - keyed by pid, which is
@@ -136,37 +197,46 @@ def _run_log_file(log_path: Path) -> Iterator[None]:
     so one run is one self-contained, durable record. That is the audit trail
     this library is actually differentiated on.
 
-    The handler is attached to the shared "mpengine" parent logger, so records
-    from both `mpengine.engine` and `mpengine.orchestrator` land in it.
-
-    Level handling is deliberately restrained. A logger's level decides whether
-    a record is created at all, and that decision is shared by every handler
-    downstream - so forcing DEBUG here to enrich the file would also push
-    DEBUG records into the caller's own handlers (a per-job line for all
-    10,000 jobs appearing in someone's console who asked for INFO). Instead the
-    level is only lowered as far as INFO, and only when it was coarser than
-    that, so the file always captures the full lifecycle and every failure
-    without ever making the caller's output noisier than they configured. A
-    caller who genuinely wants per-job DEBUG detail in the file just sets DEBUG
-    themselves. Everything is restored on the way out, including if the run
-    raises.
+    Attached directly to THREE loggers, not just the shared "mpengine" parent:
+    "mpengine.orchestrator" and "mpengine.engine" both set `propagate = False`
+    (so their lifecycle chatter never reaches a caller's own logging setup -
+    see the note by each `_log` definition), which means a handler placed
+    only on "mpengine" would never see their records at all. Attaching
+    directly to each stops there being any gap; "mpengine.summary" (the
+    stored-here paths and ranking) still climbs normally, so attaching to
+    "mpengine" as well is what captures those. Level handling is deliberately
+    restrained: forcing DEBUG on any of these would also push DEBUG records
+    into a caller's own handlers wherever they DO propagate (a per-job line
+    for all 10,000 jobs appearing in someone's console who asked for INFO) -
+    instead each logger's level is only ever lowered as far as INFO, and only
+    when it was coarser than that, so the file always captures the full
+    lifecycle and every failure without ever making the caller's own output
+    noisier than they configured. A caller who genuinely wants per-job DEBUG
+    detail in the file just sets DEBUG themselves. Everything is restored on
+    the way out, including if the run raises.
     """
-    parent = logging.getLogger("mpengine")
+    loggers = [
+        logging.getLogger("mpengine"),
+        logging.getLogger("mpengine.orchestrator"),
+        logging.getLogger("mpengine.engine"),
+    ]
     handler = logging.FileHandler(log_path / "run.log", encoding="utf-8")
     handler.setLevel(logging.DEBUG)
     handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
     )
-    previous_level = parent.level
-    if not parent.isEnabledFor(logging.INFO):
-        parent.setLevel(logging.INFO)
-    parent.addHandler(handler)
+    previous_levels = [lg.level for lg in loggers]
+    for lg in loggers:
+        if not lg.isEnabledFor(logging.INFO):
+            lg.setLevel(logging.INFO)
+        lg.addHandler(handler)
     try:
         yield
     finally:
-        parent.removeHandler(handler)
+        for lg, level in zip(loggers, previous_levels):
+            lg.removeHandler(handler)
+            lg.setLevel(level)
         handler.close()
-        parent.setLevel(previous_level)
 
 
 def _validate_labels(labels: list[str]) -> None:
@@ -388,15 +458,18 @@ def _progress_renderer(
 def _log_worker_ranking(stats: dict[int, WorkerStats]) -> None:
     """Rank workers fastest-to-slowest by seconds per atom.
 
-    Emitted through `logging`, not `print`: this is run reporting, and a
-    library that writes it unconditionally to stdout breaks piping, notebooks
-    and log aggregation for anything embedding mpengine. Callers who want to
-    see it configure logging (e.g. `logging.basicConfig(level=logging.INFO)`);
-    callers who do not are no longer forced to.
+    A real `_summary_log.info(...)` call, nothing else - visibility on an
+    interactive terminal comes entirely from `_terminal_summary_handler`
+    attaching a real handler for the run's duration, not from a second print
+    alongside the log call. This can only ever produce output when `stats` is
+    non-empty, which only happens in the first place when the terminal is
+    real (see `run()` - `stats` is populated solely by the live-display
+    renderer).
 
-    Note the caveat logged alongside: with uneven atom sizes - the normal case
-    in quant work - a low s/atom can mean small atoms rather than a genuinely
-    faster worker, so the fastest/slowest tags are a hint, not a measurement.
+    Note the caveat logged alongside: with uneven atom sizes - the normal
+    case in quant work - a low s/atom can mean small atoms rather than a
+    genuinely faster worker, so the fastest/slowest tags are a hint, not a
+    measurement.
     """
     if not stats:
         return
@@ -412,7 +485,7 @@ def _log_worker_ranking(stats: dict[int, WorkerStats]) -> None:
             f"avg {s.avg_atom_s:6.2f}s/atom  {s.atoms_per_s:6.2f} atoms/s{tag}"
         )
     lines.append("  (uneven atom sizes: a low s/atom can mean small atoms, not a faster worker)")
-    _log.info("\n".join(lines))
+    _summary_log.info("\n".join(lines))
 
 
 def run(
@@ -429,6 +502,7 @@ def run(
     n_workers: int = N_WORKERS,
     debug: bool = False,
     show_progress: bool = False,
+    text_progress: bool | None = None,
 ) -> RunSummary:
     """Run `func(**params)` for every dict in `param_sets`, organized.
 
@@ -455,6 +529,12 @@ def run(
     moment that worker finishes an atom. It also prints a fastest-to-slowest
     ranking at the end, and fills `RunSummary.worker_stats` (keyed by pid) so
     the same numbers are available programmatically.
+
+    `text_progress` overrides whether the book's `\r`-overwriting stderr line
+    runs (only relevant when `show_progress=False`; the default, `None`,
+    keeps today's behaviour - on when interactive, off otherwise). Force it
+    to `False` if you're watching per-job DEBUG/INFO logging instead: the two
+    would otherwise both write to the terminal and visually clash.
     """
     if base_dir is not None:
         base = Path(base_dir)
@@ -532,13 +612,28 @@ def run(
             f.write(f"  {label}: {params}\n")
         f.write("\n")
 
+    # The terminal/prod split lives here: a real terminal gets the spider, the
+    # live progress display and the worker summary logs made visible with zero
+    # configuration, since those are things worth seeing live. Redirected -
+    # piped, under a supervisor, in CI - none of that shows; only `logging`
+    # output exists, for whatever the deployment itself configures to collect it.
+    interactive = sys.stderr.isatty()
+
     # One durable record per run: everything from here down - dispatch,
     # milestones, every job outcome, the summary - is captured to
     # <log_dir>/run.log as well as going to the caller's own handlers.
-    with _run_log_file(log_path):
+    # `_terminal_summary_handler` is what makes the stored-here paths and the
+    # worker ranking (both real `_summary_log` calls, see above) actually
+    # visible on an interactive terminal without any caller configuration.
+    # Order matters: _terminal_summary_handler must check for an externally
+    # configured handler BEFORE _run_log_file attaches its own FileHandler to
+    # "mpengine" - reversed, it would mistake our own run.log handler for a
+    # caller-configured one and skip attaching the terminal handler entirely.
+    with _terminal_summary_handler(interactive), _run_log_file(log_path):
         worker_stats: dict[int, WorkerStats] = {}
 
-        print_banner(task, n_workers, debug)
+        if interactive:
+            print_banner(task, n_workers, debug)
         _log.info(
             "run start run_id=%s task=%s func=%s n_jobs=%d n_workers=%d "
             "debug=%s show_progress=%s",
@@ -583,7 +678,7 @@ def run(
         # The live display is a terminal affordance. Interactively it is the whole
         # point; redirected to a log file tqdm's redraws are unreadable noise, so
         # in prod we fall back to the engine's periodic INFO milestones instead.
-        interactive = sys.stderr.isatty()
+        # (`interactive` itself was already computed above, before the banner.)
         live_display = show_progress and not debug and interactive
         if show_progress and not debug and not interactive:
             _log.info(
@@ -597,7 +692,15 @@ def run(
             for r in raw_results:
                 log_job(os.getpid(), 0.0, r)
         elif live_display:
-            with _progress_renderer(len(jobs), task, worker_stats) as render:
+            # logging_redirect_tqdm is tqdm's own answer to exactly this
+            # clash: for its duration, any logging call that would otherwise
+            # write straight to the terminal (ours - log_job's per-job
+            # DEBUG/WARNING - or a caller's own configured handler) is instead
+            # routed through tqdm.write(), which clears the active bars,
+            # prints the line cleanly above them, and redraws them - instead
+            # of corrupting their redraw or spawning duplicate bar lines.
+            with _progress_renderer(len(jobs), task, worker_stats) as render, \
+                 logging_redirect_tqdm():
                 def on_progress(pid: int, atom_s: float, result: Any) -> None:
                     log_job(pid, atom_s, result)
                     render(pid, atom_s, result)
@@ -606,12 +709,24 @@ def run(
                     jobs, task=task, n_workers=n_workers,
                     on_progress=on_progress, on_job_error=on_job_error,
                     text_progress=False,
+                    # The tqdm bar above already shows aggregate progress -
+                    # the engine's own milestone logging would just repeat it.
+                    milestones=False,
                 )
         else:
+            # `text_progress=None` keeps the existing default (the book's
+            # `\r` line whenever interactive and show_progress=False);
+            # passing it explicitly - e.g. to force it off so per-job DEBUG
+            # logging isn't fighting a `\r`-rewriting line on the same
+            # stream - always wins.
+            effective_text_progress = (
+                text_progress if text_progress is not None
+                else (not show_progress) and interactive
+            )
             raw_results = process_jobs(
                 jobs, task=task, n_workers=n_workers,
                 on_progress=log_job, on_job_error=on_job_error,
-                text_progress=(not show_progress) and interactive,
+                text_progress=effective_text_progress,
             )
         elapsed_s = time.perf_counter() - t0
 
@@ -647,15 +762,17 @@ def run(
             run_id, task, n_ok, n_failed, elapsed_s,
             (len(raw_results) / elapsed_s) if elapsed_s > 0 else 0.0,
         )
-        # Deliberately an unconditional print, not logging - same reasoning as
-        # the banner. Every other run-level message (dispatch lifecycle,
-        # per-job outcomes, the worker ranking) is opt-in via `logging` so
-        # embedding this library stays quiet by default; these three lines are
-        # the one thing worth seeing on every run with zero configuration -
-        # where the results actually landed.
-        print(f"Logs stored here     - {log_path}")
-        print(f"Output stored here   - {output_path}")
-        print(f"Manifest stored here - {manifest_path}")
+        # Real _summary_log.info(...) calls - reaches run.log and any handler
+        # a prod deployment configures either way. On an interactive terminal
+        # with nothing configured, `_terminal_summary_handler` (entered above)
+        # is what makes them actually appear on screen - there is no separate
+        # print() standing in for a log line here.
+        for label, value in (
+            ("Logs stored here    ", log_path),
+            ("Output stored here  ", output_path),
+            ("Manifest stored here", manifest_path),
+        ):
+            _summary_log.info("%s - %s", label, value)
 
         return RunSummary(
             run_id=run_id,

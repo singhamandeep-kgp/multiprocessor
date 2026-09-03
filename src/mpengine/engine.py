@@ -25,6 +25,15 @@ from typing import Any, Callable
 import cloudpickle
 
 _log = logging.getLogger("mpengine.engine")
+# Lifecycle logging (dispatch start/done, worker-count clamping, progress
+# milestones) is always captured in full by orchestrator.run()'s run.log, but
+# is deliberately never allowed to bubble up past this logger to whatever the
+# CALLER's own logging setup is (root, via logging.basicConfig or similar) -
+# a caller configuring logging for their own unrelated purposes should not
+# suddenly also see mpengine's internal chatter. Only "mpengine.summary" (the
+# stored-here paths and the worker ranking, see orchestrator.py) is meant to
+# surface there.
+_log.propagate = False
 
 
 def expand_call(kargs: dict[str, Any]) -> Any:
@@ -108,6 +117,7 @@ def process_jobs(
     on_progress: Callable[[int, float, Any], None] | None = None,
     on_job_error: Callable[[int, BaseException], None] | None = None,
     text_progress: bool | None = None,
+    milestones: bool = True,
 ) -> list[Any]:
     """Ch.20 Snippet 20.9 (`processJobs`) - parallel dispatch over a process pool.
 
@@ -153,7 +163,12 @@ def process_jobs(
     is running AND stderr is a real terminal. That distinction matters in
     production - redirected to a log file, a `\\r` line per job is unreadable
     noise, so when the text display is off this logs periodic completion
-    milestones at INFO instead. Pass True/False to force it either way.
+    milestones at INFO instead - unless `milestones=False`, which a caller
+    passes when `on_progress` is itself a live visual display (a tqdm bar,
+    say) rather than merely a logging hook: the milestones would otherwise be
+    redundant with - and print right alongside - that display. `on_progress`
+    alone isn't the right signal for this, since a caller can legitimately
+    want per-job callbacks (for logging, say) with no visual display at all.
 
     `on_job_error`, if given, is called as `on_job_error(index, exc)` for any
     job that cannot be *serialized* for submission, and that job is skipped
@@ -210,8 +225,11 @@ def process_jobs(
     if text_progress is None:
         text_progress = on_progress is None and sys.stderr.isatty()
     # When nothing is drawing live, log milestones so a redirected run still
-    # shows movement - roughly ten lines, whatever the job count.
-    milestone = max(1, n_submitted // 10) if not text_progress else 0
+    # shows movement - roughly ten lines, whatever the job count. `milestones`
+    # is the caller's explicit say on this, separate from text_progress/
+    # on_progress: it's the only signal that actually means "something else
+    # is already showing a visual progress display, don't duplicate it."
+    milestone = max(1, n_submitted // 10) if (not text_progress and milestones) else 0
 
     _log.info(
         "dispatch start task=%s n_jobs=%d n_workers=%d text_progress=%s",

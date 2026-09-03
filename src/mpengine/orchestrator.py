@@ -42,6 +42,13 @@ from mpengine.engine import expand_call, process_jobs, process_jobs_
 
 N_WORKERS = os.cpu_count() or 4
 
+# Run reporting goes through logging rather than print, so embedding mpengine
+# in a larger app or a CI job does not pollute stdout. The library adds no
+# handler of its own (a library must not configure the root logger); callers
+# who want to see this call logging.basicConfig(level=logging.INFO). The
+# spider banner is the one deliberate exception and still prints.
+_log = logging.getLogger("mpengine")
+
 # one FileHandler-backed logger per worker *process*, lazily created on that
 # process's first job and reused for every job after - keyed by pid, which is
 # always fresh in a newly spawned worker, so no cross-run coordination needed
@@ -111,7 +118,56 @@ def load_run_outputs(
     path = Path(run_dir)
     if not path.is_dir():
         raise NotADirectoryError(f"not a run output directory: {path}")
-    return {p.name: load_fn(p) for p in sorted(path.iterdir()) if p.is_file()}
+    # Skip `.<label>.partial` leftovers: those are in-flight or abandoned
+    # writes from `_run_and_save_job`, never a finished result.
+    return {
+        p.name: load_fn(p)
+        for p in sorted(path.iterdir())
+        if p.is_file() and not (p.name.startswith(".") and p.name.endswith(".partial"))
+    }
+
+
+def _validate_labels(labels: list[str]) -> None:
+    """Reject labels that are unsafe or ambiguous as filenames.
+
+    Each label is used directly as a filename (`output_dir / label`), and
+    pathlib's `/` is unforgiving about what that permits: an absolute label
+    discards the base directory entirely, `..` walks out of the run tree, and
+    an empty label collapses onto the run directory itself so `save_fn` is
+    handed a directory to write. None of that is reachable from hostile input
+    - a caller only ever passes its own labels - but all of it silently writes
+    somewhere other than the run directory, which is worth a loud error rather
+    than a debugging session.
+
+    Duplicates are rejected for a different reason: two jobs sharing a label
+    write to one path, both report `ok` with that same `output_path`, and
+    whichever finishes last silently wins. The other result is simply gone.
+    """
+    bad: list[str] = []
+    for label in labels:
+        if not isinstance(label, str) or not label.strip():
+            bad.append(f"{label!r} (empty)")
+        elif Path(label).is_absolute() or (len(label) > 1 and label[1] == ":"):
+            bad.append(f"{label!r} (absolute path)")
+        elif "/" in label or "\\" in label:
+            bad.append(f"{label!r} (contains a path separator)")
+        elif ".." in Path(label).parts:
+            bad.append(f"{label!r} (contains '..')")
+    if bad:
+        raise ValueError(
+            "labels are used directly as output filenames, so these are not usable: "
+            + ", ".join(bad)
+        )
+
+    seen: dict[str, int] = {}
+    for label in labels:
+        seen[label] = seen.get(label, 0) + 1
+    dupes = sorted(lbl for lbl, n in seen.items() if n > 1)
+    if dupes:
+        raise ValueError(
+            "labels must be unique - each one names an output file, so duplicates "
+            f"would overwrite each other: {', '.join(repr(d) for d in dupes)}"
+        )
 
 
 def _get_worker_logger(log_dir: Path) -> logging.Logger:
@@ -133,7 +189,7 @@ def _get_worker_logger(log_dir: Path) -> logging.Logger:
 
 
 def _run_and_save_job(job: dict) -> JobResult:
-    """The actual Pool/sequential target. Unwraps its own bookkeeping fields,
+    """The actual worker/sequential target. Unwraps its own bookkeeping fields,
     calls the caller's function via `expand_call` (reusing engine.py rather
     than reimplementing the dict-to-call trick), saves the result, and always
     returns a JobResult - exceptions are caught here, never re-raised, so one
@@ -153,11 +209,24 @@ def _run_and_save_job(job: dict) -> JobResult:
         logger.error("failed %s: %s\n%s", label, exc, traceback.format_exc())
         return JobResult(label=label, status="error", error=str(exc))
 
+    # Write to a sibling temp path and only then rename into place. A save_fn
+    # that dies partway through (plausible for a large or custom serializer)
+    # would otherwise leave partial bytes at the real output path while the job
+    # is correctly recorded as failed - and a later `load_run_outputs`, which
+    # loads every file it finds, would then choke on that corpse and take down
+    # the read-back of an otherwise healthy run. os.replace is atomic on both
+    # POSIX and Windows, so the final path only ever holds a complete result.
     output_path = output_dir / label
+    tmp_path = output_dir / f".{label}.partial"
     try:
-        save_fn(result, output_path)
+        save_fn(result, tmp_path)
+        os.replace(tmp_path, output_path)
     except Exception as exc:
         logger.error("save failed %s: %s\n%s", label, exc, traceback.format_exc())
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         return JobResult(label=label, status="error", error=f"save failed: {exc}")
 
     logger.info("completed %s -> %s", label, output_path)
@@ -235,7 +304,11 @@ def _progress_renderer(
     overall = tqdm(total=n_jobs, desc=task, position=0, file=sys.stderr, mininterval=0)
     worker_bars: dict[int, tqdm] = {}
     available_names = _WORKER_NAMES.copy()
-    random.shuffle(available_names)
+    # A private Random instance, not `random.shuffle`. Shuffling via the module
+    # function advances the interpreter-global RNG, so picking cosmetic worker
+    # codenames would perturb any caller relying on `random` for a reproducible
+    # sequence - a real hazard for the Monte Carlo work this engine is aimed at.
+    random.Random().shuffle(available_names)
 
     def _next_worker_name() -> str:
         if available_names:
@@ -270,26 +343,34 @@ def _progress_renderer(
             bar.close()
 
 
-def _print_worker_ranking(stats: dict[int, WorkerStats]) -> None:
+def _log_worker_ranking(stats: dict[int, WorkerStats]) -> None:
     """Rank workers fastest-to-slowest by seconds per atom.
 
-    Note the caveat printed alongside: with uneven atom sizes, a low
-    s/atom can mean small atoms rather than a genuinely faster worker.
+    Emitted through `logging`, not `print`: this is run reporting, and a
+    library that writes it unconditionally to stdout breaks piping, notebooks
+    and log aggregation for anything embedding mpengine. Callers who want to
+    see it configure logging (e.g. `logging.basicConfig(level=logging.INFO)`);
+    callers who do not are no longer forced to.
+
+    Note the caveat logged alongside: with uneven atom sizes - the normal case
+    in quant work - a low s/atom can mean small atoms rather than a genuinely
+    faster worker, so the fastest/slowest tags are a hint, not a measurement.
     """
     if not stats:
         return
 
     ranked = sorted(stats.values(), key=lambda s: s.avg_atom_s)
-    print("\nworkers, fastest to slowest (by avg seconds per atom):")
+    lines = ["workers, fastest to slowest (by avg seconds per atom):"]
     for i, s in enumerate(ranked):
         tag = ""
         if len(ranked) > 1:
             tag = "  <- fastest" if i == 0 else ("  <- slowest" if i == len(ranked) - 1 else "")
-        print(
+        lines.append(
             f"  {s.name:<12} (PID {s.pid:>6})  {s.n_atoms:>3} atoms  "
             f"avg {s.avg_atom_s:6.2f}s/atom  {s.atoms_per_s:6.2f} atoms/s{tag}"
         )
-    print("  (uneven atom sizes: a low s/atom can mean small atoms, not a faster worker)")
+    lines.append("  (uneven atom sizes: a low s/atom can mean small atoms, not a faster worker)")
+    _log.info("\n".join(lines))
 
 
 def run(
@@ -353,8 +434,25 @@ def run(
             f"pass base_dir, or all of output_dir/log_dir/manifest_dir (missing: {', '.join(missing)})"
         )
 
-    task = task or func.__name__
-    run_id = f"{task}_{dt.datetime.now():%Y%m%d_%H%M%S}"
+    # `func.__name__` is not safe: a functools.partial or a callable object -
+    # both of which this engine explicitly supports - has no __name__.
+    func_name = getattr(func, "__name__", None) or type(func).__name__ or "job"
+    task = task or func_name
+
+    # Everything above and below this point is validation; no directory,
+    # manifest or banner is produced until it all passes, so a rejected call
+    # cannot leave orphaned run artefacts behind.
+    labels = labels or [f"job_{i:04d}" for i in range(len(param_sets))]
+    if len(labels) != len(param_sets):
+        raise ValueError(f"got {len(labels)} labels for {len(param_sets)} param sets")
+    _validate_labels(labels)
+
+    # Microseconds, not seconds. At second resolution two runs of the same task
+    # inside one second produced an identical run_id, and because the
+    # directories are made with exist_ok=True they were silently *shared*: the
+    # second run's manifest, opened 'w', truncated the first run's manifest
+    # outright, and default job_NNNN labels overwrote its outputs.
+    run_id = f"{task}_{dt.datetime.now():%Y%m%d_%H%M%S_%f}"
 
     output_path = Path(output_dir) / run_id
     log_path = Path(log_dir) / run_id
@@ -362,10 +460,6 @@ def run(
     log_path.mkdir(parents=True, exist_ok=True)
     Path(manifest_dir).mkdir(parents=True, exist_ok=True)
     manifest_path = Path(manifest_dir) / f"{run_id}.txt"
-
-    labels = labels or [f"job_{i:04d}" for i in range(len(param_sets))]
-    if len(labels) != len(param_sets):
-        raise ValueError(f"got {len(labels)} labels for {len(param_sets)} param sets")
 
     jobs = [
         {
@@ -384,7 +478,7 @@ def run(
     with open(manifest_path, "w") as f:
         f.write(f"run_id: {run_id}\n")
         f.write(f"launched: {dt.datetime.now().isoformat(sep=' ', timespec='seconds')}\n")
-        f.write(f"func: {func.__name__}\n")
+        f.write(f"func: {func_name}\n")
         f.write(f"task: {task}\n")
         f.write(f"n_workers: {n_workers}\n")
         f.write(f"debug: {debug}\n")
@@ -400,18 +494,46 @@ def run(
 
     print_banner(task, n_workers, debug)
 
+    # A job that cannot even be cloudpickled for submission becomes one failed
+    # JobResult rather than sinking the whole batch - the same per-job
+    # isolation this layer already promises for jobs that fail while running.
+    unsendable: list[JobResult] = []
+
+    def on_job_error(index: int, exc: BaseException) -> None:
+        unsendable.append(
+            JobResult(
+                label=labels[index],
+                status="error",
+                error=f"could not be serialized for dispatch: {exc}",
+            )
+        )
+
     t0 = time.perf_counter()
     if debug:
         raw_results = process_jobs_(jobs)
     elif show_progress:
         with _progress_renderer(len(jobs), task, worker_stats) as on_progress:
-            raw_results = process_jobs(jobs, task=task, n_workers=n_workers, on_progress=on_progress)
+            raw_results = process_jobs(
+                jobs, task=task, n_workers=n_workers,
+                on_progress=on_progress, on_job_error=on_job_error,
+            )
     else:
-        raw_results = process_jobs(jobs, task=task, n_workers=n_workers)
+        raw_results = process_jobs(
+            jobs, task=task, n_workers=n_workers, on_job_error=on_job_error,
+        )
     elapsed_s = time.perf_counter() - t0
 
     if show_progress and not debug:
-        _print_worker_ranking(worker_stats)
+        _log_worker_ranking(worker_stats)
+
+    # Restore submission order. `process_jobs` yields in completion order (by
+    # design - that is what makes its progress reporting honest), but these
+    # results are label-addressed, so a caller zipping them against the
+    # param_sets it passed in would silently mismatch. Jobs that never made it
+    # off the ground are folded back into their original positions too.
+    raw_results = raw_results + unsendable
+    label_order = {label: i for i, label in enumerate(labels)}
+    raw_results.sort(key=lambda r: label_order.get(r.label, len(label_order)))
 
     n_ok = sum(1 for r in raw_results if r.status == "ok")
     n_failed = len(raw_results) - n_ok
@@ -427,9 +549,9 @@ def run(
         f.write(f"n_failed: {n_failed}\n")
         f.write(f"elapsed_s: {elapsed_s:.3f}\n")
 
-    print(f"Logs stored here     - {log_path}")
-    print(f"Output stored here   - {output_path}")
-    print(f"Manifest stored here - {manifest_path}")
+    _log.info("Logs stored here     - %s", log_path)
+    _log.info("Output stored here   - %s", output_path)
+    _log.info("Manifest stored here - %s", manifest_path)
 
     return RunSummary(
         run_id=run_id,

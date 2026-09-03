@@ -14,8 +14,12 @@ Four demonstrations, on deliberately domain-neutral toy callbacks (no price
 data here - this exercise is about the plumbing, not the workload):
 
   a. exercise 6 - `process_jobs_`, the sequential debug path
-  b. exercise 7 - `process_jobs`, real mp.Pool + imap_unordered, showing
-     completion order diverge from submission order
+  b. exercise 7 - `process_jobs`, a real process pool, showing completion
+     order diverge from submission order. (The book's snippet used
+     `mp.Pool` + `imap_unordered`; `mpengine` since moved to
+     `ProcessPoolExecutor` + `as_completed`, which streams results in
+     completion order just the same but can also detect a worker that dies
+     mid-job instead of hanging forever.)
   c. exercise 7 - the same buggy job list down both paths, comparing how
      debuggable each failure is (the book's "Heisenbug" footnote)
   d. two structurally different callbacks - different argument types, different
@@ -46,9 +50,10 @@ SMALL_JOB_ENDS = [200_000, 400_000, 600_000, 800_000]
 # -- two toy callbacks (module-level: Windows `spawn` needs these importable) -
 #
 # Every callback returns a (label, value) pair rather than a bare value. That's
-# not decoration: `imap_unordered` hands back results detached from the jobs
-# that produced them, so with unordered completion the only reliable way to know
-# what a result belongs to is to carry its identity inside the result itself.
+# not decoration: the engine hands back results detached from the jobs that
+# produced them (completion order, not submission order), so the only reliable
+# way to know what a result belongs to is to carry its identity inside the
+# result itself.
 
 
 def sum_of_squares(start: int, end: int) -> tuple[str, int]:
@@ -122,7 +127,7 @@ def demo_sequential() -> None:
 
 
 def demo_unordered() -> None:
-    print("-- (b) exercise 7: process_jobs (mp.Pool + imap_unordered) " + "-" * 18)
+    print("-- (b) exercise 7: process_jobs (real process pool) " + "-" * 26)
     jobs = [build_job(sum_of_squares, start=0, end=end) for end in JOB_ENDS]
     employed = min(N_WORKERS, len(jobs))
     print(f"employing {employed} worker process(es) for {len(jobs)} job(s) (N_WORKERS={N_WORKERS})")
@@ -200,13 +205,13 @@ def main() -> None:
     print(
         "Expected: the sequential path fails immediately at the bad job's exact\n"
         "position, with an ordinary in-process traceback you could attach a debugger\n"
-        "to. The pool path streams some successful results first, then surfaces a\n"
-        "RemoteTraceback re-raised from a worker that has already died - nothing in\n"
-        "it identifies which job dict was at fault. That gap is why process_jobs_\n"
-        "exists at all. Read the printed tracebacks rather than assuming this.\n"
+        "to. The pool path streams some successful results first, then re-raises the\n"
+        "worker's exception in the parent - and nothing in it identifies which job\n"
+        "dict was at fault. That gap is why process_jobs_ exists at all. Read the\n"
+        "printed tracebacks rather than assuming this.\n"
         "\n"
-        "Note the labelled (label, value) returns throughout: with imap_unordered,\n"
-        "results come back detached from the jobs that produced them, so identity\n"
+        "Note the labelled (label, value) returns throughout: results come back in\n"
+        "completion order, detached from the jobs that produced them, so identity\n"
         "has to travel inside the result itself."
     )
 

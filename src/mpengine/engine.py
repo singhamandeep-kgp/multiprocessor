@@ -14,10 +14,11 @@ which is the hinge the whole engine turns on.
 from __future__ import annotations
 
 import datetime as dt
-import multiprocessing as mp
 import os
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from typing import Any, Callable
 
 import cloudpickle
@@ -67,8 +68,8 @@ def report_progress(job_num: int, num_jobs: int, time0: float, task: str) -> Non
 
 
 def _run_from_blob(blob: bytes) -> tuple[int, float, Any]:
-    """Pool target: undo the cloudpickle wrapping `process_jobs` applies before
-    submission, then dispatch exactly as `expand_call` always has.
+    """Executor target: undo the cloudpickle wrapping `process_jobs` applies
+    before submission, then dispatch exactly as `expand_call` always has.
 
     Returns `(pid, atom_seconds, result)`. The pid attributes the completion to
     a specific worker process; `atom_seconds` is measured around the call
@@ -84,31 +85,57 @@ def _run_from_blob(blob: bytes) -> tuple[int, float, Any]:
     return os.getpid(), time.perf_counter() - t0, result
 
 
+def _infer_task_name(jobs: list[dict[str, Any]]) -> str:
+    """Best-effort display name for a job list.
+
+    The obvious `jobs[0]["func"].__name__` crashes with AttributeError on the
+    very callables this engine goes out of its way to support: a
+    `functools.partial` (a natural way to pin one big fitted object once) and
+    any class instance implementing `__call__` have no `__name__`. Degrade to
+    the type name, then to a constant, rather than refusing to run.
+    """
+    func = jobs[0].get("func")
+    return getattr(func, "__name__", None) or type(func).__name__ or "job"
+
+
 def process_jobs(
     jobs: list[dict[str, Any]],
     task: str | None = None,
     n_workers: int = os.cpu_count() or 4,
     on_progress: Callable[[int, float, Any], None] | None = None,
+    on_job_error: Callable[[int, BaseException], None] | None = None,
 ) -> list[Any]:
-    """Ch.20 Snippet 20.9 (`processJobs`) - real `mp.Pool` + `imap_unordered`.
+    """Ch.20 Snippet 20.9 (`processJobs`) - parallel dispatch over a process pool.
 
-    Named `n_workers`, not `n_threads`: this spawns OS *processes* via
-    `mp.Pool`, each with its own interpreter and memory space, not threads
-    sharing one. That distinction matters here specifically - ex02 measured
-    that CPython's GIL makes threads add nothing for CPU-bound work, which is
-    exactly what this engine dispatches.
+    Named `n_workers`, not `n_threads`: this spawns OS *processes*, each with
+    its own interpreter and memory space, not threads sharing one. That
+    distinction matters here specifically - ex02 measured that CPython's GIL
+    makes threads add nothing for CPU-bound work, which is exactly what this
+    engine dispatches.
 
     Results arrive in *completion* order, not submission order, which is what
     lets `report_progress` report honestly as each job lands - with uneven job
     costs (see ex03), an early-submitted heavy job can finish long after
-    several later-submitted light ones.
+    several later-submitted light ones. (`orchestrator.run` re-sorts back to
+    submission order before returning, since its results are label-addressed.)
 
     Each job is serialized with `cloudpickle` before submission (rather than
-    relying on `Pool`'s own stdlib-`pickle` handling of `jobs`), so a job's
-    'func' - or a nested callable, like `orchestrator.run`'s `save_fn` - can be
-    a closure or a lambda, not just a module-level function. `_run_from_blob`
-    is itself a plain module-level function, so it still pickles by reference
-    with no dependence on `__main__` spawn fixup.
+    relying on the executor's own stdlib-`pickle` handling), so a job's 'func'
+    - or a nested callable, like `orchestrator.run`'s `save_fn` - can be a
+    closure or a lambda, not just a module-level function. `_run_from_blob` is
+    itself a plain module-level function, so it still pickles by reference with
+    no dependence on `__main__` spawn fixup.
+
+    Deliberately built on `concurrent.futures.ProcessPoolExecutor` rather than
+    the book's literal `mp.Pool` + `imap_unordered`. `mp.Pool` cannot detect a
+    worker that DIES mid-job (OOM-killed, or segfaulting inside native code
+    such as BLAS): CPython only resolves a task slot when a result arrives on
+    the output queue, and a dead process posts nothing, so the run blocks
+    forever with no exception and no log line. `ProcessPoolExecutor` watches
+    its workers and raises `BrokenProcessPool` instead - a hang that never
+    surfaces is far worse for an unattended run than a loud failure. The
+    `with` block here is also genuinely graceful, unlike `mp.Pool.__exit__`,
+    which calls `terminate()`.
 
     `on_progress`, if given, is called as `on_progress(pid, atom_seconds,
     result)` for every completed job - `pid` identifies which worker process
@@ -122,31 +149,66 @@ def process_jobs(
     that call - the two would otherwise both write to stderr and garble each
     other's redraws.
 
-    Uses explicit close()+join() rather than `with mp.Pool(...) as pool:`,
-    whose __exit__ calls terminate() - an abrupt kill, not the book's graceful
-    shutdown. The try/finally still lets a job's exception propagate while
-    guaranteeing the workers are torn down.
+    `on_job_error`, if given, is called as `on_job_error(index, exc)` for any
+    job that cannot be *serialized* for submission, and that job is skipped
+    instead of sinking the batch. Jobs are cloudpickled up front, so without
+    this one unpicklable payload (a lock, a live socket, an open file handle
+    captured by a closure) raises before any job runs at all - job 517 of 1000
+    taking down the 999 that were perfectly runnable. Left as None, that
+    original fail-fast behaviour is preserved, which keeps this layer
+    book-faithful; `orchestrator.run` opts in to turn such a failure into one
+    failed job, matching the per-job isolation it already promises.
     """
+    if not jobs:
+        return []
     if task is None:
-        task = jobs[0]["func"].__name__
-    blobs = [cloudpickle.dumps(job) for job in jobs]
-    # `Pool(processes=n)` spawns exactly n OS processes immediately, whether
-    # or not there's n jobs' worth of work - never spin up more workers than
-    # there are jobs to hand them. This only ever clamps downward: when jobs
-    # outnumber n_workers, no clamp is needed at all - the same fixed pool
-    # keeps pulling jobs off the queue, one per worker at a time, until the
-    # whole list is done. Worker count is sized to hardware, not job count.
-    pool = mp.Pool(processes=min(n_workers, len(jobs)))
+        task = _infer_task_name(jobs)
+
+    # Serialize per job rather than in one comprehension, so a single
+    # unpicklable payload can be attributed and skipped instead of aborting
+    # the whole submission (see `on_job_error`).
+    blobs: list[bytes] = []
+    for i, job in enumerate(jobs):
+        try:
+            blobs.append(cloudpickle.dumps(job))
+        except Exception as exc:
+            if on_job_error is None:
+                raise
+            on_job_error(i, exc)
+    if not blobs:
+        return []
+
+    # Never spin up more workers than there are jobs to hand them: the
+    # executor starts its processes eagerly, so surplus workers pay full spawn
+    # cost to do nothing. This only ever clamps downward - when jobs outnumber
+    # n_workers no clamp is needed, since the same fixed pool keeps pulling
+    # jobs until the list is done. Worker count is sized to hardware, not to
+    # job count.
     out: list[Any] = []
     time0 = time.time()
-    try:
-        for i, (pid, atom_s, out_) in enumerate(pool.imap_unordered(_run_from_blob, blobs), 1):
-            out.append(out_)
-            if on_progress is not None:
-                on_progress(pid, atom_s, out_)
-            else:
-                report_progress(i, len(jobs), time0, task)
-    finally:
-        pool.close()
-        pool.join()
+    n_submitted = len(blobs)
+    with ProcessPoolExecutor(max_workers=min(n_workers, n_submitted)) as executor:
+        futures = [executor.submit(_run_from_blob, blob) for blob in blobs]
+        try:
+            for i, future in enumerate(as_completed(futures), 1):
+                pid, atom_s, out_ = future.result()
+                out.append(out_)
+                if on_progress is not None:
+                    on_progress(pid, atom_s, out_)
+                else:
+                    report_progress(i, n_submitted, time0, task)
+        except BrokenProcessPool as exc:
+            # Cancel whatever has not started so shutdown does not block on
+            # work that can never complete, then re-raise with the context the
+            # bare stdlib error lacks: how far the run actually got.
+            for future in futures:
+                future.cancel()
+            raise BrokenProcessPool(
+                f"a worker process died during task {task!r} after "
+                f"{len(out)}/{n_submitted} jobs completed - it was most likely "
+                f"OOM-killed or crashed inside native code (e.g. BLAS). The "
+                f"completed jobs' results were lost with the pool; if you need "
+                f"per-job durability use orchestrator.run, which saves each "
+                f"result to disk as it lands."
+            ) from exc
     return out

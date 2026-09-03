@@ -98,7 +98,7 @@ run with a custom `save_fn`, pass the matching reader as
 | `show_progress` | live terminal display: one overall bar for the whole run, plus a live rate number per worker process. Ignored when `debug=True` |
 
 Develop with `debug=True`, then flip it off. Chasing a bug through a process
-pool means reading a `RemoteTraceback` from a worker that has already exited,
+pool means reading a traceback re-raised from a worker that has already exited,
 and it never tells you which job dict was at fault.
 
 ### Closures and lambdas

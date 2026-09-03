@@ -647,9 +647,15 @@ def run(
             run_id, task, n_ok, n_failed, elapsed_s,
             (len(raw_results) / elapsed_s) if elapsed_s > 0 else 0.0,
         )
-        _log.info("Logs stored here     - %s", log_path)
-        _log.info("Output stored here   - %s", output_path)
-        _log.info("Manifest stored here - %s", manifest_path)
+        # Deliberately an unconditional print, not logging - same reasoning as
+        # the banner. Every other run-level message (dispatch lifecycle,
+        # per-job outcomes, the worker ranking) is opt-in via `logging` so
+        # embedding this library stays quiet by default; these three lines are
+        # the one thing worth seeing on every run with zero configuration -
+        # where the results actually landed.
+        print(f"Logs stored here     - {log_path}")
+        print(f"Output stored here   - {output_path}")
+        print(f"Manifest stored here - {manifest_path}")
 
         return RunSummary(
             run_id=run_id,

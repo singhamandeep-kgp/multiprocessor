@@ -7,6 +7,48 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the
 version is below 1.0, breaking changes may land in a minor release — each one
 is called out under **Breaking** with the migration needed.
 
+## [0.3.1] — 2026-09-03
+
+Refines the terminal/logging split 0.3.0 introduced, based on actually running
+it: real terminals and logging-configured callers each get exactly what's
+relevant to them, and never end up in each other's way.
+
+### Fixed
+
+- **The stored-here paths and worker ranking are real `logging` calls, not a
+  `print()` formatted to look like one.** They now reach the terminal via an
+  actual handler (`mpengine.summary`), automatically attached only when the
+  terminal is real and only when the caller hasn't configured logging
+  themselves - never a hand-formatted string standing in for a log record.
+- **Lifecycle logging (run start, dispatch start/done, per-job DEBUG/WARNING,
+  worker-count clamping) no longer leaks to a caller's own logging setup.**
+  Configuring `logging.basicConfig()` for unrelated reasons no longer also
+  surfaces mpengine's internal chatter - it's still captured in full in
+  `run.log`, just never propagated past `mpengine.orchestrator` /
+  `mpengine.engine` to the console.
+- **The spider banner and worker ranking only appear on a real terminal.**
+  Piped, redirected, or under a supervisor/CI, neither prints - only
+  `logging` output exists there, for whatever the deployment configures.
+- **A live progress display and configured logging no longer corrupt each
+  other.** `show_progress=True` together with `logging.basicConfig()` used to
+  either spawn duplicate bars or garble the redraw. Fixed with tqdm's own
+  `logging_redirect_tqdm`, verified at the byte level on a shared stream.
+- **Redundant milestone logging during a live display.** The engine's
+  periodic "done=X/Y" milestones, meant as a fallback when nothing else shows
+  progress, used to also fire alongside an active tqdm bar.
+- **A lambda or unnamed callable used as `task` could produce an invalid
+  Windows path.** `func.__name__` for a lambda is literally `'<lambda>'`, and
+  `<`/`>` aren't legal in Windows filenames; task-name inference now degrades
+  to the type name instead of crashing `run()`'s own directory creation.
+
+### Added
+
+- `process_jobs()` gained `milestones: bool` (default `True`) - a caller
+  driving its own live display passes `milestones=False` to suppress the
+  now-redundant fallback logging.
+- `run()` gained `text_progress: bool | None` - forces the book's `\r`
+  progress line on or off, overriding the automatic terminal-detection.
+
 ## [0.3.0] — 2026-09-03
 
 A correctness and observability release. Ten defects found in an audit of the
@@ -121,6 +163,7 @@ logs, on-disk results and per-job failure isolation, `lin_parts`/`nested_parts`
 partitioning, closure and lambda support via `cloudpickle`, and a live
 per-worker progress display.
 
+[0.3.1]: https://github.com/singhamandeep-kgp/multiprocessor/releases/tag/v0.3.1
 [0.3.0]: https://github.com/singhamandeep-kgp/multiprocessor/releases/tag/v0.3.0
 [0.2.0]: https://github.com/singhamandeep-kgp/multiprocessor/releases/tag/v0.2.0
 [0.1.2]: https://github.com/singhamandeep-kgp/multiprocessor/releases/tag/v0.1.2

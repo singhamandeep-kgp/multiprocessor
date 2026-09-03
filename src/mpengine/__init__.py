@@ -39,6 +39,16 @@ Learning*, Ch.20 - the docstrings name the specific snippets - but nothing here
 is finance-specific; it parallelizes any callable.
 """
 
+import logging as _logging
+
+# A library must never configure logging for its host application - it only
+# names its loggers and attaches a no-op handler so that a caller who has set
+# nothing up sees no "No handlers could be found" noise. To actually see any
+# of it: logging.basicConfig(level=logging.INFO). Loggers are
+# "mpengine.engine" and "mpengine.orchestrator", so either half can be tuned
+# or silenced on its own.
+_logging.getLogger("mpengine").addHandler(_logging.NullHandler())
+
 from mpengine.engine import expand_call, process_jobs, process_jobs_, report_progress
 from mpengine.orchestrator import (
     JobResult,

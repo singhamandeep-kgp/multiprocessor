@@ -14,6 +14,7 @@ which is the hinge the whole engine turns on.
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import os
 import sys
 import time
@@ -22,6 +23,8 @@ from concurrent.futures.process import BrokenProcessPool
 from typing import Any, Callable
 
 import cloudpickle
+
+_log = logging.getLogger("mpengine.engine")
 
 
 def expand_call(kargs: dict[str, Any]) -> Any:
@@ -104,6 +107,7 @@ def process_jobs(
     n_workers: int = os.cpu_count() or 4,
     on_progress: Callable[[int, float, Any], None] | None = None,
     on_job_error: Callable[[int, BaseException], None] | None = None,
+    text_progress: bool | None = None,
 ) -> list[Any]:
     """Ch.20 Snippet 20.9 (`processJobs`) - parallel dispatch over a process pool.
 
@@ -144,10 +148,12 @@ def process_jobs(
     `show_progress`) drive a per-worker live display with real timings. The
     return value here is unaffected either way - still the plain `list[Any]`
     of results, never the `(pid, atom_seconds, result)` triples.
-    Supplying `on_progress` means the caller is rendering its own progress
-    display, so the book's own text-based `report_progress` is skipped for
-    that call - the two would otherwise both write to stderr and garble each
-    other's redraws.
+    `text_progress` controls the book's own `\\r`-overwriting stderr line.
+    Left at None it is automatic: emitted only when no `on_progress` display
+    is running AND stderr is a real terminal. That distinction matters in
+    production - redirected to a log file, a `\\r` line per job is unreadable
+    noise, so when the text display is off this logs periodic completion
+    milestones at INFO instead. Pass True/False to force it either way.
 
     `on_job_error`, if given, is called as `on_job_error(index, exc)` for any
     job that cannot be *serialized* for submission, and that job is skipped
@@ -174,8 +180,13 @@ def process_jobs(
         except Exception as exc:
             if on_job_error is None:
                 raise
+            _log.warning(
+                "job could not be serialized for dispatch, skipping "
+                "task=%s job_index=%d error=%s", task, i, exc,
+            )
             on_job_error(i, exc)
     if not blobs:
+        _log.warning("nothing dispatchable task=%s n_jobs=%d", task, len(jobs))
         return []
 
     # Never spin up more workers than there are jobs to hand them: the
@@ -187,7 +198,26 @@ def process_jobs(
     out: list[Any] = []
     time0 = time.time()
     n_submitted = len(blobs)
-    with ProcessPoolExecutor(max_workers=min(n_workers, n_submitted)) as executor:
+    n_pool = min(n_workers, n_submitted)
+    if n_pool < n_workers:
+        _log.warning(
+            "n_workers=%d clamped to %d task=%s reason=fewer jobs than workers",
+            n_workers, n_pool, task,
+        )
+
+    # Auto: the book's carriage-return line is a terminal affordance, so only emit it when
+    # a terminal is actually there and nothing else owns the display.
+    if text_progress is None:
+        text_progress = on_progress is None and sys.stderr.isatty()
+    # When nothing is drawing live, log milestones so a redirected run still
+    # shows movement - roughly ten lines, whatever the job count.
+    milestone = max(1, n_submitted // 10) if not text_progress else 0
+
+    _log.info(
+        "dispatch start task=%s n_jobs=%d n_workers=%d text_progress=%s",
+        task, n_submitted, n_pool, text_progress,
+    )
+    with ProcessPoolExecutor(max_workers=n_pool) as executor:
         futures = [executor.submit(_run_from_blob, blob) for blob in blobs]
         try:
             for i, future in enumerate(as_completed(futures), 1):
@@ -195,14 +225,24 @@ def process_jobs(
                 out.append(out_)
                 if on_progress is not None:
                     on_progress(pid, atom_s, out_)
-                else:
+                if text_progress:
                     report_progress(i, n_submitted, time0, task)
+                elif milestone and (i % milestone == 0 or i == n_submitted):
+                    _log.info(
+                        "progress task=%s done=%d/%d pct=%.0f elapsed_s=%.2f",
+                        task, i, n_submitted, 100.0 * i / n_submitted,
+                        time.time() - time0,
+                    )
         except BrokenProcessPool as exc:
             # Cancel whatever has not started so shutdown does not block on
             # work that can never complete, then re-raise with the context the
             # bare stdlib error lacks: how far the run actually got.
             for future in futures:
                 future.cancel()
+            _log.error(
+                "worker process died task=%s completed=%d/%d - run aborted",
+                task, len(out), n_submitted,
+            )
             raise BrokenProcessPool(
                 f"a worker process died during task {task!r} after "
                 f"{len(out)}/{n_submitted} jobs completed - it was most likely "
@@ -211,4 +251,8 @@ def process_jobs(
                 f"per-job durability use orchestrator.run, which saves each "
                 f"result to disk as it lands."
             ) from exc
+    _log.info(
+        "dispatch done task=%s completed=%d/%d elapsed_s=%.2f",
+        task, len(out), n_submitted, time.time() - time0,
+    )
     return out

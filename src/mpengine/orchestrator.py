@@ -47,7 +47,7 @@ N_WORKERS = os.cpu_count() or 4
 # handler of its own (a library must not configure the root logger); callers
 # who want to see this call logging.basicConfig(level=logging.INFO). The
 # spider banner is the one deliberate exception and still prints.
-_log = logging.getLogger("mpengine")
+_log = logging.getLogger("mpengine.orchestrator")
 
 # one FileHandler-backed logger per worker *process*, lazily created on that
 # process's first job and reused for every job after - keyed by pid, which is
@@ -125,6 +125,48 @@ def load_run_outputs(
         for p in sorted(path.iterdir())
         if p.is_file() and not (p.name.startswith(".") and p.name.endswith(".partial"))
     }
+
+
+@contextmanager
+def _run_log_file(log_path: Path) -> Iterator[None]:
+    """Capture the parent's whole view of one run into `<log_dir>/run.log`.
+
+    The per-worker files record what each worker did; this records what the
+    run as a whole did - dispatch, milestones, per-job outcomes, the summary -
+    so one run is one self-contained, durable record. That is the audit trail
+    this library is actually differentiated on.
+
+    The handler is attached to the shared "mpengine" parent logger, so records
+    from both `mpengine.engine` and `mpengine.orchestrator` land in it.
+
+    Level handling is deliberately restrained. A logger's level decides whether
+    a record is created at all, and that decision is shared by every handler
+    downstream - so forcing DEBUG here to enrich the file would also push
+    DEBUG records into the caller's own handlers (a per-job line for all
+    10,000 jobs appearing in someone's console who asked for INFO). Instead the
+    level is only lowered as far as INFO, and only when it was coarser than
+    that, so the file always captures the full lifecycle and every failure
+    without ever making the caller's output noisier than they configured. A
+    caller who genuinely wants per-job DEBUG detail in the file just sets DEBUG
+    themselves. Everything is restored on the way out, including if the run
+    raises.
+    """
+    parent = logging.getLogger("mpengine")
+    handler = logging.FileHandler(log_path / "run.log", encoding="utf-8")
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+    )
+    previous_level = parent.level
+    if not parent.isEnabledFor(logging.INFO):
+        parent.setLevel(logging.INFO)
+    parent.addHandler(handler)
+    try:
+        yield
+    finally:
+        parent.removeHandler(handler)
+        handler.close()
+        parent.setLevel(previous_level)
 
 
 def _validate_labels(labels: list[str]) -> None:
@@ -490,78 +532,134 @@ def run(
             f.write(f"  {label}: {params}\n")
         f.write("\n")
 
-    worker_stats: dict[int, WorkerStats] = {}
+    # One durable record per run: everything from here down - dispatch,
+    # milestones, every job outcome, the summary - is captured to
+    # <log_dir>/run.log as well as going to the caller's own handlers.
+    with _run_log_file(log_path):
+        worker_stats: dict[int, WorkerStats] = {}
 
-    print_banner(task, n_workers, debug)
-
-    # A job that cannot even be cloudpickled for submission becomes one failed
-    # JobResult rather than sinking the whole batch - the same per-job
-    # isolation this layer already promises for jobs that fail while running.
-    unsendable: list[JobResult] = []
-
-    def on_job_error(index: int, exc: BaseException) -> None:
-        unsendable.append(
-            JobResult(
-                label=labels[index],
-                status="error",
-                error=f"could not be serialized for dispatch: {exc}",
-            )
+        print_banner(task, n_workers, debug)
+        _log.info(
+            "run start run_id=%s task=%s func=%s n_jobs=%d n_workers=%d "
+            "debug=%s show_progress=%s",
+            run_id, task, func_name, len(jobs), n_workers, debug, show_progress,
+        )
+        _log.info(
+            "run dirs run_id=%s output_dir=%s log_dir=%s manifest=%s",
+            run_id, output_path, log_path, manifest_path,
         )
 
-    t0 = time.perf_counter()
-    if debug:
-        raw_results = process_jobs_(jobs)
-    elif show_progress:
-        with _progress_renderer(len(jobs), task, worker_stats) as on_progress:
+        # A job that cannot even be cloudpickled for submission becomes one failed
+        # JobResult rather than sinking the whole batch - the same per-job
+        # isolation this layer already promises for jobs that fail while running.
+        unsendable: list[JobResult] = []
+
+        def on_job_error(index: int, exc: BaseException) -> None:
+            unsendable.append(
+                JobResult(
+                    label=labels[index],
+                    status="error",
+                    error=f"could not be serialized for dispatch: {exc}",
+                )
+            )
+
+        def log_job(pid: int, atom_s: float, result: Any) -> None:
+            """Surface every job outcome in the PARENT log as it lands.
+
+            Successes are DEBUG - a 10,000-job sweep should not write 10,000 INFO
+            lines - but failures are WARNING, because until now a failed job was
+            only ever written to that worker's own file and an operator watching
+            the run's logs saw nothing at all until the manifest was read.
+            """
+            label = getattr(result, "label", "?")
+            if getattr(result, "status", None) == "ok":
+                _log.debug("job ok label=%s pid=%s atom_s=%.3f", label, pid, atom_s)
+            else:
+                _log.warning(
+                    "job FAILED label=%s pid=%s atom_s=%.3f error=%s",
+                    label, pid, atom_s, getattr(result, "error", None),
+                )
+
+        # The live display is a terminal affordance. Interactively it is the whole
+        # point; redirected to a log file tqdm's redraws are unreadable noise, so
+        # in prod we fall back to the engine's periodic INFO milestones instead.
+        interactive = sys.stderr.isatty()
+        live_display = show_progress and not debug and interactive
+        if show_progress and not debug and not interactive:
+            _log.info(
+                "progress display disabled run_id=%s reason=stderr is not a terminal "
+                "(logging milestones instead)", run_id,
+            )
+
+        t0 = time.perf_counter()
+        if debug:
+            raw_results = process_jobs_(jobs)
+            for r in raw_results:
+                log_job(os.getpid(), 0.0, r)
+        elif live_display:
+            with _progress_renderer(len(jobs), task, worker_stats) as render:
+                def on_progress(pid: int, atom_s: float, result: Any) -> None:
+                    log_job(pid, atom_s, result)
+                    render(pid, atom_s, result)
+
+                raw_results = process_jobs(
+                    jobs, task=task, n_workers=n_workers,
+                    on_progress=on_progress, on_job_error=on_job_error,
+                    text_progress=False,
+                )
+        else:
             raw_results = process_jobs(
                 jobs, task=task, n_workers=n_workers,
-                on_progress=on_progress, on_job_error=on_job_error,
+                on_progress=log_job, on_job_error=on_job_error,
+                text_progress=(not show_progress) and interactive,
             )
-    else:
-        raw_results = process_jobs(
-            jobs, task=task, n_workers=n_workers, on_job_error=on_job_error,
+        elapsed_s = time.perf_counter() - t0
+
+        if worker_stats:
+            _log_worker_ranking(worker_stats)
+
+        # Restore submission order. `process_jobs` yields in completion order (by
+        # design - that is what makes its progress reporting honest), but these
+        # results are label-addressed, so a caller zipping them against the
+        # param_sets it passed in would silently mismatch. Jobs that never made it
+        # off the ground are folded back into their original positions too.
+        raw_results = raw_results + unsendable
+        label_order = {label: i for i, label in enumerate(labels)}
+        raw_results.sort(key=lambda r: label_order.get(r.label, len(label_order)))
+
+        n_ok = sum(1 for r in raw_results if r.status == "ok")
+        n_failed = len(raw_results) - n_ok
+
+        with open(manifest_path, "a") as f:
+            f.write("results:\n")
+            for r in raw_results:
+                if r.status == "ok":
+                    f.write(f"  {r.label}: ok -> {r.output_path}\n")
+                else:
+                    f.write(f"  {r.label}: ERROR - {r.error}\n")
+            f.write(f"\nn_ok: {n_ok}\n")
+            f.write(f"n_failed: {n_failed}\n")
+            f.write(f"elapsed_s: {elapsed_s:.3f}\n")
+
+        _log.info(
+            "run done run_id=%s task=%s n_ok=%d n_failed=%d elapsed_s=%.2f "
+            "throughput_jobs_s=%.2f",
+            run_id, task, n_ok, n_failed, elapsed_s,
+            (len(raw_results) / elapsed_s) if elapsed_s > 0 else 0.0,
         )
-    elapsed_s = time.perf_counter() - t0
+        _log.info("Logs stored here     - %s", log_path)
+        _log.info("Output stored here   - %s", output_path)
+        _log.info("Manifest stored here - %s", manifest_path)
 
-    if show_progress and not debug:
-        _log_worker_ranking(worker_stats)
-
-    # Restore submission order. `process_jobs` yields in completion order (by
-    # design - that is what makes its progress reporting honest), but these
-    # results are label-addressed, so a caller zipping them against the
-    # param_sets it passed in would silently mismatch. Jobs that never made it
-    # off the ground are folded back into their original positions too.
-    raw_results = raw_results + unsendable
-    label_order = {label: i for i, label in enumerate(labels)}
-    raw_results.sort(key=lambda r: label_order.get(r.label, len(label_order)))
-
-    n_ok = sum(1 for r in raw_results if r.status == "ok")
-    n_failed = len(raw_results) - n_ok
-
-    with open(manifest_path, "a") as f:
-        f.write("results:\n")
-        for r in raw_results:
-            if r.status == "ok":
-                f.write(f"  {r.label}: ok -> {r.output_path}\n")
-            else:
-                f.write(f"  {r.label}: ERROR - {r.error}\n")
-        f.write(f"\nn_ok: {n_ok}\n")
-        f.write(f"n_failed: {n_failed}\n")
-        f.write(f"elapsed_s: {elapsed_s:.3f}\n")
-
-    _log.info("Logs stored here     - %s", log_path)
-    _log.info("Output stored here   - %s", output_path)
-    _log.info("Manifest stored here - %s", manifest_path)
-
-    return RunSummary(
-        run_id=run_id,
-        manifest_path=str(manifest_path),
-        output_dir=str(output_path),
-        log_dir=str(log_path),
-        n_jobs=len(jobs),
-        n_ok=n_ok,
-        n_failed=n_failed,
-        elapsed_s=elapsed_s,
-        results=raw_results,
-        worker_stats=worker_stats,
-    )
+        return RunSummary(
+            run_id=run_id,
+            manifest_path=str(manifest_path),
+            output_dir=str(output_path),
+            log_dir=str(log_path),
+            n_jobs=len(jobs),
+            n_ok=n_ok,
+            n_failed=n_failed,
+            elapsed_s=elapsed_s,
+            results=raw_results,
+            worker_stats=worker_stats,
+        )

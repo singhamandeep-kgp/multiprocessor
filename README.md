@@ -13,6 +13,7 @@ Every run produces three things:
 | a manifest of exactly what was launched, and how it ended | `<base>/manifests/<run_id>.txt` |
 | each job's result, saved to disk | `<base>/outputs/<run_id>/<label>` |
 | one log file per **worker process** | `<base>/logs/<run_id>/worker_<pid>.log` |
+| a log of the run as a whole | `<base>/logs/<run_id>/run.log` |
 
 A single job failing does **not** abort the run — it is recorded as a failed
 job and the rest continue.
@@ -100,6 +101,40 @@ run with a custom `save_fn`, pass the matching reader as
 Develop with `debug=True`, then flip it off. Chasing a bug through a process
 pool means reading a traceback re-raised from a worker that has already exited,
 and it never tells you which job dict was at fault.
+
+### Logging
+
+The library logs its whole lifecycle through the standard `logging` module and
+writes nothing to stdout except the banner, so embedding it never pollutes a
+host application's output. It installs only a `NullHandler` — to see anything,
+configure logging yourself:
+
+```python
+import logging
+logging.basicConfig(level=logging.INFO)
+```
+
+Two loggers, so either half can be tuned or silenced independently:
+
+| logger | emits |
+|---|---|
+| `mpengine.orchestrator` | run start/done, resolved dirs, per-job outcomes, worker ranking |
+| `mpengine.engine` | dispatch start/done, worker-count clamping, progress milestones, worker death |
+
+Levels: **INFO** for run lifecycle, **DEBUG** for per-job success (a 10,000-job
+sweep would otherwise be 10,000 INFO lines), **WARNING** for a failed job or a
+clamped worker count, **ERROR** for a dead worker.
+
+Every run also writes `<log_dir>/<run_id>/run.log` containing the parent's
+whole view of that run — dispatch, milestones, every job outcome, the summary —
+alongside the existing per-worker log files. That happens regardless of how you
+configure logging, so a run is always a self-contained durable record.
+
+**Progress display is terminal-aware.** Interactively you get the tqdm bars and
+per-worker lines as before. When stderr is not a terminal — piped, redirected to
+a log file, running under CI or a scheduler — those are suppressed (they render
+as unreadable escape-sequence noise in a file) and periodic completion
+milestones are logged at INFO instead.
 
 ### Closures and lambdas
 
